@@ -11,6 +11,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import base64
+import io
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +70,8 @@ class AnalysisResponse(BaseModel):
     recommendations: list[str]
     risk_indicators: list[str]
     opportunities: list[str]
+    sentiment_chart_b64: str | None = None
+    engagement_chart_b64: str | None = None
 
 
 
@@ -124,6 +134,98 @@ def _extract_json(raw: str) -> dict:
         cleaned[:200],
         0,
     )
+
+
+
+
+sns.set_theme(style="whitegrid", palette="muted")
+
+
+def _fig_to_b64(fig: plt.Figure) -> str:
+    """Encode a matplotlib Figure as a base64 data-URI string."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
+
+
+def _render_sentiment_chart(
+    sentiment_a: "SentimentCount",
+    sentiment_b: "SentimentCount",
+    label_a: str,
+    label_b: str,
+) -> str:
+    """Grouped bar chart: positive / neutral / negative for two brands."""
+    categories = ["Positive", "Neutral", "Negative"]
+    brand_a_vals = [sentiment_a.positive, sentiment_a.neutral, sentiment_a.negative]
+    brand_b_vals = [sentiment_b.positive, sentiment_b.neutral, sentiment_b.negative]
+
+    x = range(len(categories))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars_a = ax.bar([i - width / 2 for i in x], brand_a_vals, width, label=label_a, color="#3b82f6")
+    bars_b = ax.bar([i + width / 2 for i in x], brand_b_vals, width, label=label_b, color="#f59e0b")
+
+    ax.set_ylabel("Post Count")
+    ax.set_title("Sentiment Distribution by Brand")
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories)
+    ax.legend()
+
+    for bar in bars_a:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                str(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
+    for bar in bars_b:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                str(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
+
+    b64 = _fig_to_b64(fig)
+    plt.close(fig)
+    return b64
+
+
+def _render_engagement_chart(
+    acc_a: "AccountSnapshot",
+    acc_b: "AccountSnapshot",
+    label_a: str,
+    label_b: str,
+) -> str:
+    """Grouped bar chart comparing engagement metrics for two brands."""
+    metrics = ["Followers", "Total\nEngagement", "Avg Likes"]
+    vals_a = [acc_a.followers, acc_a.total_engagement, acc_a.avg_likes]
+    vals_b = [acc_b.followers, acc_b.total_engagement, acc_b.avg_likes]
+
+    x = range(len(metrics))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars_a = ax.bar([i - width / 2 for i in x], vals_a, width, label=label_a, color="#3b82f6")
+    bars_b = ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color="#f59e0b")
+
+    ax.set_ylabel("Count")
+    ax.set_title("Engagement Metrics Comparison")
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics)
+    ax.legend()
+
+    def _fmt(v: int) -> str:
+        if v >= 1_000_000:
+            return f"{v/1_000_000:.1f}M"
+        if v >= 1_000:
+            return f"{v/1_000:.1f}K"
+        return str(v)
+
+    for bar in bars_a:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                _fmt(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
+    for bar in bars_b:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                _fmt(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
+
+    b64 = _fig_to_b64(fig)
+    plt.close(fig)
+    return b64
 
 
 @app.get("/api/health")
@@ -202,6 +304,9 @@ Focus on vaccine awareness, public health education in Indonesia, and practical 
 
         data = _extract_json(raw)
 
+
+        sentiment_b64 = _render_sentiment_chart(kv.sentiment, gsk.sentiment, "Kalventis", "GSK")
+        engagement_b64 = _render_engagement_chart(kv, gsk, "Kalventis", "GSK")
         return AnalysisResponse(
             executive_summary=data.get("executive_summary", ""),
             kalventis_insights=data.get("kalventis_insights", ""),
@@ -209,6 +314,8 @@ Focus on vaccine awareness, public health education in Indonesia, and practical 
             recommendations=data.get("recommendations", []),
             risk_indicators=data.get("risk_indicators", []),
             opportunities=data.get("opportunities", []),
+            sentiment_chart_b64=sentiment_b64,
+            engagement_chart_b64=engagement_b64,
         )
 
     except json.JSONDecodeError as e:
@@ -255,6 +362,8 @@ class DeepAnalysisResponse(BaseModel):
     risk_assessment: list[str]
     growth_opportunities: list[str]
     recommendations: list[str]
+    sentiment_chart_b64: str | None = None
+    engagement_chart_b64: str | None = None
 
 
 @app.post("/api/v1/monitoring/analysis")
@@ -373,6 +482,9 @@ Base every insight on the actual data provided. Reference specific numbers. If d
 
         data = _extract_json(raw)
 
+
+        sentiment_b64 = _render_sentiment_chart(a.sentiment, b.sentiment, request.brand_a_name, request.brand_b_name)
+        engagement_b64 = _render_engagement_chart(a, b, request.brand_a_name, request.brand_b_name)
         return DeepAnalysisResponse(
             executive_summary=data.get("executive_summary", ""),
             brand_a_insights=data.get("brand_a_insights", ""),
@@ -384,6 +496,8 @@ Base every insight on the actual data provided. Reference specific numbers. If d
             risk_assessment=data.get("risk_assessment", []),
             growth_opportunities=data.get("growth_opportunities", []),
             recommendations=data.get("recommendations", []),
+            sentiment_chart_b64=sentiment_b64,
+            engagement_chart_b64=engagement_b64,
         )
 
     except json.JSONDecodeError as e:
