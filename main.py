@@ -612,7 +612,7 @@ async def kalventis_overview_analysis(request: KalventisAnalysisRequest) -> Kalv
 
         posts_text = "\n".join(
             f"[{i+1}] {p.type}: {p.likes} likes, {p.comments} comments — \"{p.caption[:200]}\""
-            for i, p in enumerate(request.posts[:100])
+            for i, p in enumerate(request.posts[:50])
         )
 
         prompt = """Analyze these Instagram posts from @kenapaharusvaksin (Kalventis), an Indonesian vaccine education brand. Perform two analyses:
@@ -636,7 +636,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
 
         result = model.generate_content(
             prompt,
-            generation_config={"temperature": 0, "max_output_tokens": 2048, "response_mime_type": "application/json"},
+            generation_config={"temperature": 0, "max_output_tokens": 4096, "response_mime_type": "application/json"},
         )
         raw = result.text.strip()
         data = _extract_json(raw)
