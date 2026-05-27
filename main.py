@@ -733,7 +733,7 @@ Base every insight on the actual data provided. Reference specific numbers. If d
 
         response = model.generate_content(
             [sentiment_llm_img, engagement_llm_img, prompt],
-            generation_config={"temperature": 0, "max_output_tokens": 8192},
+            generation_config={"temperature": 0, "max_output_tokens": 65536},
         )
         raw = response.text.strip()
 
