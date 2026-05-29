@@ -27,6 +27,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from agentic_chat import run_agentic_chat  # noqa: E402
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -1103,56 +1105,84 @@ async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
     if not GEMINI_API_KEY:
         return SocialChatResponse(response="Gemini API key not configured.")
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-
     ctx = request.context
     if ctx:
         kv_sent = ctx.kalventis_sentiment
         gsk_sent = ctx.gsk_sentiment
-        context_block = f"""You are an expert social media analyst assistant for Kalventis, an Indonesian vaccine awareness brand (@kenapaharusvaksin).
-You have access to the following real-time social listening dashboard data:
-
-=== KALVENTIS (@kenapaharusvaksin) ===
-Followers: {ctx.kalventis_followers:,}
-Posts scraped: {ctx.kalventis_posts}
-Avg likes/post: {ctx.kalventis_avg_likes}
-Total engagement: {ctx.kalventis_total_engagement:,}
-Sentiment: {kv_sent.get('positive', 0)} positive / {kv_sent.get('neutral', 0)} neutral / {kv_sent.get('negative', 0)} negative
-
-=== GSK COMPETITOR (@ayokitavaksin) ===
-Followers: {ctx.gsk_followers:,}
-Posts scraped: {ctx.gsk_posts}
-Avg likes/post: {ctx.gsk_avg_likes}
-Total engagement: {ctx.gsk_total_engagement:,}
-Sentiment: {gsk_sent.get('positive', 0)} positive / {gsk_sent.get('neutral', 0)} neutral / {gsk_sent.get('negative', 0)} negative
-
-=== COMPETITIVE POSITION ===
-Follower ratio: Kalventis is {ctx.follower_ratio:.1f}x larger
-Post ratio: Kalventis is {ctx.post_ratio:.1f}x more active
-Period: {ctx.period}
-
-=== MARKET CONTEXT ===
-Active topics: {', '.join(ctx.top_topics[:8]) or 'None'}
-Top mentioned words: {', '.join(ctx.top_words[:12]) or 'None'}
-News articles monitored: {ctx.news_count}
-
-Answer questions concisely and practically based on this data. Use bullet points where helpful. Be specific with numbers when relevant."""
+        context_block = (
+            "You are an expert social media analyst assistant for Kalventis, "
+            "an Indonesian vaccine awareness brand (@kenapaharusvaksin).\n"
+            "You have access to the following real-time social listening dashboard data:\n\n"
+            "=== KALVENTIS (@kenapaharusvaksin) ===\n"
+            f"Followers: {ctx.kalventis_followers:,}\n"
+            f"Posts scraped: {ctx.kalventis_posts}\n"
+            f"Avg likes/post: {ctx.kalventis_avg_likes}\n"
+            f"Total engagement: {ctx.kalventis_total_engagement:,}\n"
+            f"Sentiment: {kv_sent.get('positive', 0)} positive / "
+            f"{kv_sent.get('neutral', 0)} neutral / {kv_sent.get('negative', 0)} negative\n\n"
+            "=== GSK COMPETITOR (@ayokitavaksin) ===\n"
+            f"Followers: {ctx.gsk_followers:,}\n"
+            f"Posts scraped: {ctx.gsk_posts}\n"
+            f"Avg likes/post: {ctx.gsk_avg_likes}\n"
+            f"Total engagement: {ctx.gsk_total_engagement:,}\n"
+            f"Sentiment: {gsk_sent.get('positive', 0)} positive / "
+            f"{gsk_sent.get('neutral', 0)} neutral / {gsk_sent.get('negative', 0)} negative\n\n"
+            "=== COMPETITIVE POSITION ===\n"
+            f"Follower ratio: Kalventis is {ctx.follower_ratio:.1f}x larger\n"
+            f"Post ratio: Kalventis is {ctx.post_ratio:.1f}x more active\n"
+            f"Period: {ctx.period}\n\n"
+            "=== MARKET CONTEXT ===\n"
+            f"Active topics: {', '.join(ctx.top_topics[:8]) or 'None'}\n"
+            f"Top mentioned words: {', '.join(ctx.top_words[:12]) or 'None'}\n"
+            f"News articles monitored: {ctx.news_count}\n\n"
+            "Answer questions concisely and practically based on this data. "
+            "Use bullet points where helpful. Be specific with numbers when relevant."
+        )
+        context_data = {
+            "brand_a_name": "Kalventis",
+            "brand_b_name": "GSK",
+            "brand_a": {
+                "followers": ctx.kalventis_followers,
+                "posts_scraped": ctx.kalventis_posts,
+                "avg_likes": ctx.kalventis_avg_likes,
+                "total_engagement": ctx.kalventis_total_engagement,
+                "sentiment": kv_sent,
+            },
+            "brand_b": {
+                "followers": ctx.gsk_followers,
+                "posts_scraped": ctx.gsk_posts,
+                "avg_likes": ctx.gsk_avg_likes,
+                "total_engagement": ctx.gsk_total_engagement,
+                "sentiment": gsk_sent,
+            },
+        }
+        context_meta = {
+            "period": ctx.period,
+            "brand_a_name": "Kalventis",
+            "brand_b_name": "GSK",
+        }
     else:
-        context_block = "You are a social media analyst assistant for Kalventis, an Indonesian vaccine awareness brand. Answer questions about social media strategy, vaccine content, and competitive analysis."
+        context_block = (
+            "You are a social media analyst assistant for Kalventis, an Indonesian vaccine "
+            "awareness brand. Answer questions about social media strategy, vaccine content, "
+            "and competitive analysis."
+        )
+        context_data = {}
+        context_meta = {"period": "current period", "brand_a_name": "Kalventis", "brand_b_name": "GSK"}
 
-    history_block = "\n".join(
-        f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}"
-        for m in request.history[-10:]
-    )
-
-    full_prompt = f"{context_block}\n\n{history_block}\n\nUser: {request.message}\nAssistant:"
+    history = [{"role": m.role, "content": m.content} for m in request.history]
 
     try:
-        response = model.generate_content(full_prompt)
-        return SocialChatResponse(response=response.text.strip())
+        response_text = run_agentic_chat(
+            message=request.message,
+            history=history,
+            context_block=context_block,
+            context_data=context_data,
+            context_meta=context_meta,
+        )
+        return SocialChatResponse(response=response_text)
     except Exception as e:
-        logger.error(f"Chat error: {e}")
+        logger.error(f"Agentic chat error: {e}")
         return SocialChatResponse(response="Sorry, I couldn't process your question. Please try again.")
 
 
@@ -1186,9 +1216,6 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
     if not GEMINI_API_KEY:
         return SocialChatResponse(response="Gemini API key not configured.")
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-
     ctx = request.context
     if ctx:
         a = ctx.brand_a
@@ -1198,7 +1225,8 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
         b_total = max(1, b.sentiment.positive + b.sentiment.neutral + b.sentiment.negative)
 
         posts_text = "\n".join(
-            f"  [{p.get('side','')}] @{p.get('username','')}: \"{str(p.get('caption',''))[:150]}\" — {p.get('engagement',0)} eng, {p.get('sentiment','Neutral')}"
+            f"  [{p.get('side','')}] @{p.get('username','')}: "
+            f"\"{str(p.get('caption',''))[:150]}\" — {p.get('engagement',0)} eng, {p.get('sentiment','Neutral')}"
             for p in ctx.top_posts[:8]
         ) or "  No post samples available."
 
@@ -1207,57 +1235,86 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
             for c in ctx.top_comments[:6]
         ) or "  No comment samples available."
 
-        context_block = f"""You are an expert social media competitive intelligence analyst.
-You have full access to the monitoring scan data below. Answer every question by referencing specific numbers from this data. Use bullet points where helpful. Be concise and actionable.
-
-=== {ctx.brand_a_name} (@{ctx.brand_a_username}) ===
-Followers: {a.followers:,}
-Posts scraped: {a.posts_scraped}
-Avg likes / post: {a.avg_likes:,}
-Total engagement: {a.total_engagement:,}
-Sentiment: {a.sentiment.positive} positive ({a.sentiment.positive/a_total*100:.0f}%) / {a.sentiment.neutral} neutral ({a.sentiment.neutral/a_total*100:.0f}%) / {a.sentiment.negative} negative ({a.sentiment.negative/a_total*100:.0f}%)
-
-=== {ctx.brand_b_name} (@{ctx.brand_b_username}) ===
-Followers: {b.followers:,}
-Posts scraped: {b.posts_scraped}
-Avg likes / post: {b.avg_likes:,}
-Total engagement: {b.total_engagement:,}
-Sentiment: {b.sentiment.positive} positive ({b.sentiment.positive/b_total*100:.0f}%) / {b.sentiment.neutral} neutral ({b.sentiment.neutral/b_total*100:.0f}%) / {b.sentiment.negative} negative ({b.sentiment.negative/b_total*100:.0f}%)
-
-=== COMPETITIVE COMPARISON ===
-Total engagement (both brands): {comp.get('engagementTotal', 0):,}
-{ctx.brand_a_name} engagement share: {comp.get('brandAEngagementShare', 0)}%
-{ctx.brand_b_name} engagement share: {comp.get('brandBEngagementShare', 0)}%
-{ctx.brand_a_name} post share: {comp.get('brandAPostShare', 0)}%
-{ctx.brand_b_name} post share: {comp.get('brandBPostShare', 0)}%
-
-=== TOP CONTENT THEMES ===
-{', '.join(ctx.top_terms[:15]) or 'Not available'}
-
-=== TOP POSTS (by engagement) ===
-{posts_text}
-
-=== AUDIENCE COMMENTS SAMPLE ===
-{comments_text}
-
-=== COVERAGE ===
-Status: {ctx.coverage.get('status', 'unknown')} · Score: {ctx.coverage.get('score', 'N/A')}%
-Note: {ctx.coverage.get('coverageNote', '')}
-
-Period: {ctx.period or 'Recent scan'}"""
+        context_block = (
+            "You are an expert social media competitive intelligence analyst.\n"
+            "You have full access to the monitoring scan data below. Answer every question "
+            "by referencing specific numbers from this data. Use bullet points where helpful. "
+            "Be concise and actionable.\n\n"
+            f"=== {ctx.brand_a_name} (@{ctx.brand_a_username}) ===\n"
+            f"Followers: {a.followers:,}\n"
+            f"Posts scraped: {a.posts_scraped}\n"
+            f"Avg likes / post: {a.avg_likes:,}\n"
+            f"Total engagement: {a.total_engagement:,}\n"
+            f"Sentiment: {a.sentiment.positive} positive ({a.sentiment.positive/a_total*100:.0f}%) / "
+            f"{a.sentiment.neutral} neutral ({a.sentiment.neutral/a_total*100:.0f}%) / "
+            f"{a.sentiment.negative} negative ({a.sentiment.negative/a_total*100:.0f}%)\n\n"
+            f"=== {ctx.brand_b_name} (@{ctx.brand_b_username}) ===\n"
+            f"Followers: {b.followers:,}\n"
+            f"Posts scraped: {b.posts_scraped}\n"
+            f"Avg likes / post: {b.avg_likes:,}\n"
+            f"Total engagement: {b.total_engagement:,}\n"
+            f"Sentiment: {b.sentiment.positive} positive ({b.sentiment.positive/b_total*100:.0f}%) / "
+            f"{b.sentiment.neutral} neutral ({b.sentiment.neutral/b_total*100:.0f}%) / "
+            f"{b.sentiment.negative} negative ({b.sentiment.negative/b_total*100:.0f}%)\n\n"
+            "=== COMPETITIVE COMPARISON ===\n"
+            f"Total engagement (both brands): {comp.get('engagementTotal', 0):,}\n"
+            f"{ctx.brand_a_name} engagement share: {comp.get('brandAEngagementShare', 0)}%\n"
+            f"{ctx.brand_b_name} engagement share: {comp.get('brandBEngagementShare', 0)}%\n"
+            f"{ctx.brand_a_name} post share: {comp.get('brandAPostShare', 0)}%\n"
+            f"{ctx.brand_b_name} post share: {comp.get('brandBPostShare', 0)}%\n\n"
+            "=== TOP CONTENT THEMES ===\n"
+            f"{', '.join(ctx.top_terms[:15]) or 'Not available'}\n\n"
+            "=== TOP POSTS (by engagement) ===\n"
+            f"{posts_text}\n\n"
+            "=== AUDIENCE COMMENTS SAMPLE ===\n"
+            f"{comments_text}\n\n"
+            "=== COVERAGE ===\n"
+            f"Status: {ctx.coverage.get('status', 'unknown')} · Score: {ctx.coverage.get('score', 'N/A')}%\n"
+            f"Note: {ctx.coverage.get('coverageNote', '')}\n\n"
+            f"Period: {ctx.period or 'Recent scan'}"
+        )
+        context_data = {
+            "brand_a_name": ctx.brand_a_name or "Brand A",
+            "brand_b_name": ctx.brand_b_name or "Brand B",
+            "brand_a": {
+                "followers": a.followers,
+                "posts_scraped": a.posts_scraped,
+                "avg_likes": a.avg_likes,
+                "total_engagement": a.total_engagement,
+                "sentiment": a.sentiment,
+            },
+            "brand_b": {
+                "followers": b.followers,
+                "posts_scraped": b.posts_scraped,
+                "avg_likes": b.avg_likes,
+                "total_engagement": b.total_engagement,
+                "sentiment": b.sentiment,
+            },
+        }
+        context_meta = {
+            "period": ctx.period or "Recent scan",
+            "brand_a_name": ctx.brand_a_name or "Brand A",
+            "brand_b_name": ctx.brand_b_name or "Brand B",
+        }
     else:
-        context_block = "You are a social media competitive intelligence analyst. Answer questions about social media strategy and competitive analysis."
+        context_block = (
+            "You are a social media competitive intelligence analyst. "
+            "Answer questions about social media strategy and competitive analysis."
+        )
+        context_data = {}
+        context_meta = {"period": "current period", "brand_a_name": "Brand A", "brand_b_name": "Brand B"}
 
-    history_block = "\n".join(
-        f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}"
-        for m in request.history[-10:]
-    )
-
-    full_prompt = f"{context_block}\n\n{history_block}\n\nUser: {request.message}\nAssistant:"
+    history = [{"role": m.role, "content": m.content} for m in request.history]
 
     try:
-        response = model.generate_content(full_prompt)
-        return SocialChatResponse(response=response.text.strip())
+        response_text = run_agentic_chat(
+            message=request.message,
+            history=history,
+            context_block=context_block,
+            context_data=context_data,
+            context_meta=context_meta,
+        )
+        return SocialChatResponse(response=response_text)
     except Exception as e:
-        logger.error(f"Monitoring chat error: {e}")
+        logger.error(f"Agentic monitoring chat error: {e}")
         return SocialChatResponse(response="Sorry, I couldn't process your question. Please try again.")
