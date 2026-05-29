@@ -685,7 +685,9 @@ Analyze the following comprehensive social media monitoring data for two brands.
 - {request.brand_b_name} post share: {comp.get('brandBPostShare', 0)}%
 
 === TOP TERMS (word cloud) ===
-{', '.join(request.top_terms[:15]) if request.top_terms else 'Not available'}
+- Combined: {', '.join(request.top_terms[:15]) if request.top_terms else 'Not available'}
+- {request.brand_a_name}: {', '.join(request.brand_a_top_terms[:15]) if request.brand_a_top_terms else 'Not available'}
+- {request.brand_b_name}: {', '.join(request.brand_b_top_terms[:15]) if request.brand_b_top_terms else 'Not available'}
 
 === SAMPLE TOP POSTS (by engagement) ===
 {top_posts_text}
@@ -724,7 +726,7 @@ Respond ONLY in valid JSON with exactly these keys. Every string field MUST cont
   "recommendations": ["Priority 1 — immediate action (next 30 days) with specific tactic", "Priority 2 — 30-60 days", "Priority 3 — 60-90 days", "Priority 4 — ongoing structural change", "Priority 5 — quick win achievable this week"],
   "sentiment_chart_insight": ["State the exact positive/neutral/negative counts for both brands and compute the positive-rate and negative-rate for each.", "Explain what the ratio between positive and negative sentiment reveals about audience trust and content resonance for each brand.", "Analyse the size of the neutral group — what does it signal about fence-sitters or low-intent followers?", "Flag the most notable pattern visible in the chart (e.g. one brand with no negatives, unusually high neutral, large gap between brands) and explain why it matters strategically.", "Explain whether the sentiment difference is driven by content quality, posting volume, topic choices, or audience composition.", "Give one concrete tactic the leading brand should protect to maintain its sentiment advantage, and one the trailing brand should adopt immediately."],
   "engagement_chart_insight": ["State the exact followers, total engagement, and avg likes values for both brands from the chart.", "Calculate the engagement-per-follower rate for each brand (total_engagement ÷ followers) and compare them — this reveals content quality independent of audience size.", "Explain what the gap between the followers differential and the engagement differential reveals — is the leader winning on reach, content resonance, or both?", "Analyse avg likes per post as a proxy for per-content quality and what the gap signals about each brand's ability to create high-performing individual posts.", "Identify whether the trailing brand's gap is primarily a reach problem (needs more followers) or a content quality problem (needs better posts per given audience).", "Name the single most actionable lever for the trailing brand: is it posting frequency, content theme, format, or audience growth?"],
-  "wordcloud_insight": ["Identify the 3-4 dominant topic clusters visible in the word list and name the specific terms that anchor each cluster.", "Explain what these clusters reveal about what the audience cares about most or what content consistently attracts engagement.", "Flag any term whose presence is surprising or whose absence is a strategic gap — what is the audience talking about that the brands are ignoring?", "Identify one underserved conversation topic: a gap between what the audience discusses and what the brand content covers.", "Suggest one specific content angle or series concept to exploit that gap and capture uncontested audience attention."]
+  "wordcloud_insight": ["Identify the 3-4 dominant topic clusters visible in the combined word list and name the specific terms that anchor each cluster.", "Compare the {request.brand_a_name} and {request.brand_b_name} word lists: name the themes each brand appears to own and any overlap or contested territory.", "Explain what these clusters reveal about what the audience cares about most or what content consistently attracts engagement.", "Flag any term whose presence is surprising or whose absence is a strategic gap — what is the audience talking about that one brand is missing?", "Suggest one specific content angle or series concept for each brand based on its distinct word cloud."]
 }}
 
 Base every insight on the actual data provided. Reference specific numbers. If data is thin or coverage is partial, acknowledge the limitation and recommend a re-scan."""  # noqa: E501
@@ -1207,6 +1209,8 @@ class MonitoringChatContext(BaseModel):
     brand_b: AccountSnapshot = AccountSnapshot()
     comparison: dict = {}
     top_terms: list[str] = []
+    brand_a_top_terms: list[str] = []
+    brand_b_top_terms: list[str] = []
     top_posts: list[dict] = []
     top_comments: list[dict] = []
     coverage: dict = {}
@@ -1271,7 +1275,9 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
             f"{ctx.brand_a_name} post share: {comp.get('brandAPostShare', 0)}%\n"
             f"{ctx.brand_b_name} post share: {comp.get('brandBPostShare', 0)}%\n\n"
             "=== TOP CONTENT THEMES ===\n"
-            f"{', '.join(ctx.top_terms[:15]) or 'Not available'}\n\n"
+            f"Combined: {', '.join(ctx.top_terms[:15]) or 'Not available'}\n"
+            f"{ctx.brand_a_name}: {', '.join(ctx.brand_a_top_terms[:15]) or 'Not available'}\n"
+            f"{ctx.brand_b_name}: {', '.join(ctx.brand_b_top_terms[:15]) or 'Not available'}\n\n"
             "=== TOP POSTS (by engagement) ===\n"
             f"{posts_text}\n\n"
             "=== AUDIENCE COMMENTS SAMPLE ===\n"
