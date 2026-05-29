@@ -391,6 +391,8 @@ class DeepAnalysisRequest(BaseModel):
     brand_b: AccountSnapshot
     comparison: dict
     top_terms: list[str] = []
+    brand_a_top_terms: list[str] = []
+    brand_b_top_terms: list[str] = []
     top_posts: list[dict] = []
     top_comments: list[dict] = []
     coverage: dict | None = None
@@ -412,6 +414,8 @@ class DeepAnalysisResponse(BaseModel):
     sentiment_chart_b64: str | None = None
     engagement_chart_b64: str | None = None
     wordcloud_chart_b64: str | None = None
+    brand_a_wordcloud_chart_b64: str | None = None
+    brand_b_wordcloud_chart_b64: str | None = None
 
 
 @app.post("/api/v1/monitoring/analysis")
@@ -535,6 +539,8 @@ Base every insight on the actual data provided. Reference specific numbers. If d
         engagement_b64 = _render_engagement_chart(a, b, request.brand_a_name, request.brand_b_name)
 
         wordcloud_b64 = _render_wordcloud_chart(request.top_terms)
+        brand_a_wordcloud_b64 = _render_wordcloud_chart(request.brand_a_top_terms)
+        brand_b_wordcloud_b64 = _render_wordcloud_chart(request.brand_b_top_terms)
         return DeepAnalysisResponse(
             executive_summary=data.get("executive_summary", ""),
             brand_a_insights=data.get("brand_a_insights", ""),
@@ -549,6 +555,8 @@ Base every insight on the actual data provided. Reference specific numbers. If d
             sentiment_chart_b64=sentiment_b64,
             engagement_chart_b64=engagement_b64,
             wordcloud_chart_b64=wordcloud_b64,
+            brand_a_wordcloud_chart_b64=brand_a_wordcloud_b64,
+            brand_b_wordcloud_chart_b64=brand_b_wordcloud_b64,
         )
 
     except json.JSONDecodeError as e:
