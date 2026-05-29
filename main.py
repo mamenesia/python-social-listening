@@ -13,6 +13,8 @@ from pydantic import BaseModel
 
 import base64
 import io
+from datetime import datetime, timezone
+from PIL import Image
 
 import matplotlib
 matplotlib.use("Agg")
@@ -24,6 +26,8 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+from agentic_chat import run_agentic_chat  # noqa: E402
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -151,6 +155,14 @@ def _fig_to_b64(fig: plt.Figure) -> str:
     return base64.b64encode(buf.read()).decode()
 
 
+def _fig_to_pil(fig: plt.Figure) -> Image.Image:
+    """Encode a matplotlib Figure as a PIL Image for multimodal LLM input."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    buf.seek(0)
+    return Image.open(buf).copy()
+
+
 def _render_sentiment_chart(
     sentiment_a: "SentimentCount",
     sentiment_b: "SentimentCount",
@@ -270,6 +282,186 @@ def _render_wordcloud_chart(words: list[str]) -> str | None:
     plt.close(fig)
     return b64
 
+
+
+def _render_sentiment_chart_for_llm(
+    sentiment_a: "SentimentCount",
+    sentiment_b: "SentimentCount",
+    label_a: str,
+    label_b: str,
+) -> Image.Image:
+    """Simple grouped bar chart sent to the LLM for visual analysis."""
+    categories = ["Positive", "Neutral", "Negative"]
+    vals_a = [sentiment_a.positive, sentiment_a.neutral, sentiment_a.negative]
+    vals_b = [sentiment_b.positive, sentiment_b.neutral, sentiment_b.negative]
+    x = range(len(categories))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars_a = ax.bar([i - width / 2 for i in x], vals_a, width, label=label_a, color="#3b82f6")
+    bars_b = ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color="#f59e0b")
+    ax.set_ylabel("Post Count")
+    ax.set_title("Sentiment Distribution by Brand")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(categories)
+    ax.legend()
+    for bar in bars_a:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                str(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
+    for bar in bars_b:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                str(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+def _render_sentiment_chart_modern(
+    sentiment_a: "SentimentCount",
+    sentiment_b: "SentimentCount",
+    label_a: str,
+    label_b: str,
+) -> str:
+    """Modern horizontal grouped bar chart shown to the frontend."""
+    categories = ["Positive", "Neutral", "Negative"]
+    vals_a = [sentiment_a.positive, sentiment_a.neutral, sentiment_a.negative]
+    vals_b = [sentiment_b.positive, sentiment_b.neutral, sentiment_b.negative]
+    total_a = max(1, sum(vals_a))
+    total_b = max(1, sum(vals_b))
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#f8f9fc")
+
+    y = list(range(len(categories)))
+    height = 0.32
+
+    bars_a = ax.barh([i + height / 2 for i in y], vals_a, height,
+                     label=label_a, color="#2557d6", alpha=0.90)
+    bars_b = ax.barh([i - height / 2 for i in y], vals_b, height,
+                     label=label_b, color="#12a594", alpha=0.90)
+
+    max_val = max(max(vals_a, default=1), max(vals_b, default=1), 1)
+
+    for bar, val, tot in zip(bars_a, vals_a, [total_a] * 3):
+        ax.text(bar.get_width() + max_val * 0.02,
+                bar.get_y() + bar.get_height() / 2,
+                f"{val}  ({val / tot * 100:.0f}%)",
+                va="center", fontsize=9, color="#374151")
+    for bar, val, tot in zip(bars_b, vals_b, [total_b] * 3):
+        ax.text(bar.get_width() + max_val * 0.02,
+                bar.get_y() + bar.get_height() / 2,
+                f"{val}  ({val / tot * 100:.0f}%)",
+                va="center", fontsize=9, color="#374151")
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(categories, fontsize=11)
+    ax.set_xlabel("Post Count", fontsize=10, color="#6b7280")
+    ax.set_title("Sentiment Distribution by Brand", fontsize=14, fontweight="bold",
+                 color="#111827", pad=16)
+    ax.set_xlim(0, max_val * 1.40)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.tick_params(left=False)
+    ax.xaxis.grid(True, linestyle="--", alpha=0.35, color="#d1d5db")
+    ax.set_axisbelow(True)
+    ax.legend(fontsize=10, loc="lower right", framealpha=0.9)
+
+    plt.tight_layout()
+    b64 = _fig_to_b64(fig)
+    plt.close(fig)
+    return b64
+
+
+def _render_engagement_chart_for_llm(
+    acc_a: "AccountSnapshot",
+    acc_b: "AccountSnapshot",
+    label_a: str,
+    label_b: str,
+) -> Image.Image:
+    """Simple grouped bar chart sent to the LLM for visual analysis."""
+    metrics = ["Followers", "Total\nEngagement", "Avg Likes"]
+    vals_a = [acc_a.followers, acc_a.total_engagement, acc_a.avg_likes]
+    vals_b = [acc_b.followers, acc_b.total_engagement, acc_b.avg_likes]
+    x = range(len(metrics))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars_a = ax.bar([i - width / 2 for i in x], vals_a, width, label=label_a, color="#3b82f6")
+    bars_b = ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color="#f59e0b")
+    ax.set_ylabel("Count")
+    ax.set_title("Engagement Metrics Comparison")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(metrics)
+    ax.legend()
+
+    def _fmt(v: int) -> str:
+        if v >= 1_000_000: return f"{v / 1_000_000:.1f}M"
+        if v >= 1_000: return f"{v / 1_000:.1f}K"
+        return str(v)
+
+    for bar in bars_a:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                _fmt(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
+    for bar in bars_b:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                _fmt(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+def _render_engagement_chart_modern(
+    acc_a: "AccountSnapshot",
+    acc_b: "AccountSnapshot",
+    label_a: str,
+    label_b: str,
+) -> str:
+    """Modern three-panel engagement comparison shown to the frontend."""
+
+    def _fmt(v: int) -> str:
+        if v >= 1_000_000: return f"{v / 1_000_000:.1f}M"
+        if v >= 1_000: return f"{v / 1_000:.1f}K"
+        return str(v)
+
+    panels = [
+        ("Followers", acc_a.followers, acc_b.followers),
+        ("Total Engagement", acc_a.total_engagement, acc_b.total_engagement),
+        ("Avg Likes / Post", acc_a.avg_likes, acc_b.avg_likes),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(11, 4.5))
+    fig.patch.set_facecolor("#ffffff")
+
+    for ax, (title, val_a, val_b) in zip(axes, panels):
+        ax.set_facecolor("#f8f9fc")
+        total = max(1, val_a + val_b)
+        bars = ax.bar(
+            [label_a, label_b], [val_a, val_b],
+            color=["#2557d6", "#12a594"], alpha=0.88, width=0.45,
+        )
+        for bar, val in zip(bars, [val_a, val_b]):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + total * 0.025,
+                _fmt(val), ha="center", va="bottom",
+                fontsize=11, fontweight="bold", color="#111827",
+            )
+        ax.set_title(title, fontsize=11, fontweight="bold", color="#374151", pad=10)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(left=False, labelleft=False)
+        ax.tick_params(axis="x", labelsize=9)
+        ax.set_axisbelow(True)
+
+    fig.suptitle(
+        f"Engagement Metrics — {label_a} vs {label_b}",
+        fontsize=13, fontweight="bold", color="#111827", y=1.02,
+    )
+    plt.tight_layout()
+    b64 = _fig_to_b64(fig)
+    plt.close(fig)
+    return b64
 
 
 @app.get("/api/health")
@@ -411,6 +603,9 @@ class DeepAnalysisResponse(BaseModel):
     risk_assessment: list[str]
     growth_opportunities: list[str]
     recommendations: list[str]
+    sentiment_chart_insight: list[str] = []
+    engagement_chart_insight: list[str] = []
+    wordcloud_insight: list[str] = []
     sentiment_chart_b64: str | None = None
     engagement_chart_b64: str | None = None
     wordcloud_chart_b64: str | None = None
@@ -507,37 +702,56 @@ Analyze the following comprehensive social media monitoring data for two brands.
 === MONITORING PERIOD ===
 {request.period or 'Recent scan window'}
 
+=== CHART IMAGES FOR VISUAL ANALYSIS ===
+Two chart images are attached to this request:
+- Image 1: Sentiment Distribution Chart — grouped bar chart showing positive, neutral, and negative post counts for both brands side by side
+- Image 2: Engagement Metrics Chart — grouped bar chart showing followers, total engagement, and avg likes per post for both brands
+Study these charts carefully when writing the chart-specific insight fields below.
+
 === INSTRUCTIONS ===
-Respond ONLY in valid JSON with exactly these keys. Every string field MUST contain substantive analysis (2-5 sentences). Every list field MUST have 3-5 items. No markdown, no code fences.
+Respond ONLY in valid JSON with exactly these keys. Every string field MUST contain substantive analysis (4-6 sentences minimum). Every list field MUST have 4-5 items. No markdown, no code fences.
 
 {{
-  "executive_summary": "2-3 sentence synthesis of the competitive landscape. Who leads, on what dimensions, and what is the single most important strategic insight from this data.",
-  "brand_a_insights": "Deep analysis of {request.brand_a_name}. Content performance patterns, engagement quality (not just volume), what content types/themes resonate. Identify their 2-3 strongest content pillars and any weaknesses visible in the data.",
-  "brand_b_insights": "Deep analysis of {request.brand_b_name}. Same depth as above. What is their competitive differentiation? Where do they outperform and underperform?",
-  "content_strategy": "Cross-brand content strategy analysis. What content themes drive highest engagement across both brands? What formats, caption styles, or post types correlate with higher engagement? What should each brand do more/less of based on the data?",
-  "competitive_analysis": "Head-to-head competitive positioning. Market share of voice, engagement efficiency (engagement per post vs follower count), content frequency vs quality tradeoffs. Who owns which conversation themes?",
-  "audience_insights": "What the audience reveals through comments and engagement patterns. What questions, concerns, or topics do they raise? What language/terminology do they use? Are there unmet information needs?",
-  "sentiment_deep_dive": "Beyond positive/neutral/negative percentages: what DRIVES sentiment? What topics or content types correlate with positive vs negative responses? Are there sentiment patterns across the two brands that suggest market-wide attitudes vs brand-specific reactions?",
-  "risk_assessment": ["Specific, concrete risk 1 with severity", "Risk 2", "Risk 3", "Risk 4"],
-  "growth_opportunities": ["Specific, actionable opportunity 1", "Opportunity 2", "Opportunity 3", "Opportunity 4"],
-  "recommendations": ["Prioritized action 1 (immediate, next 30 days)", "Action 2 (30-60 days)", "Action 3 (60-90 days)", "Action 4 (ongoing)", "Action 5 (quick win)"]
+  "executive_summary": "4-5 sentence synthesis of the competitive landscape. State who leads on each key dimension (followers, engagement, sentiment), quantify the gap with exact numbers, explain what structural advantage or content pattern is driving it, and name the single highest-leverage insight a strategist should act on immediately.",
+  "brand_a_insights": "4-6 sentences of deep analysis of {request.brand_a_name}. Cover: (1) content performance patterns and which themes drive the most engagement, (2) engagement quality (engagement-per-post vs raw volume), (3) their 2-3 strongest content pillars backed by the data, (4) their most visible weakness, and (5) one non-obvious opportunity hidden in the numbers.",
+  "brand_b_insights": "4-6 sentences of deep analysis of {request.brand_b_name}. Same depth as above — cover their competitive differentiation, where they outperform and underperform, what the engagement data reveals about their content quality, and one strategic move that would materially close the gap with {request.brand_a_name}.",
+  "content_strategy": "4-6 sentences of cross-brand content strategy. Name the specific themes (from the top terms and post samples) that drive the highest engagement across both brands. Identify which formats or caption styles correlate with higher engagement. Give one concrete recommendation for what each brand should do more of and one thing to stop.",
+  "competitive_analysis": "4-6 sentences of head-to-head competitive positioning. State exact market share of voice percentages. Calculate and compare engagement efficiency (engagement ÷ followers) for both brands. Analyse content frequency vs content quality tradeoffs. Identify which conversation topics each brand owns and which are contested.",
+  "audience_insights": "4-6 sentences on what the audience reveals through comments and engagement. Quote or paraphrase specific themes from the comment samples. Identify unmet information needs or repeated questions. Describe the language register (technical, conversational, emotional). Flag any sentiment patterns in comments that differ from post-level sentiment.",
+  "sentiment_deep_dive": "4-6 sentences going beyond raw percentages. Explain what specific content types or topics appear to DRIVE positive vs negative sentiment. Identify whether negative sentiment is brand-specific or reflects market-wide attitudes (e.g. vaccine hesitancy). Describe the neutral cohort — are they fence-sitters or low-intent? Give one tactic to shift neutral to positive.",
+  "risk_assessment": ["Specific, concrete risk 1 with severity level (High/Medium/Low)", "Risk 2 with severity", "Risk 3 with severity", "Risk 4 with severity", "Risk 5 with severity"],
+  "growth_opportunities": ["Specific, immediately actionable opportunity 1 with expected impact", "Opportunity 2", "Opportunity 3", "Opportunity 4", "Opportunity 5"],
+  "recommendations": ["Priority 1 — immediate action (next 30 days) with specific tactic", "Priority 2 — 30-60 days", "Priority 3 — 60-90 days", "Priority 4 — ongoing structural change", "Priority 5 — quick win achievable this week"],
+  "sentiment_chart_insight": ["State the exact positive/neutral/negative counts for both brands and compute the positive-rate and negative-rate for each.", "Explain what the ratio between positive and negative sentiment reveals about audience trust and content resonance for each brand.", "Analyse the size of the neutral group — what does it signal about fence-sitters or low-intent followers?", "Flag the most notable pattern visible in the chart (e.g. one brand with no negatives, unusually high neutral, large gap between brands) and explain why it matters strategically.", "Explain whether the sentiment difference is driven by content quality, posting volume, topic choices, or audience composition.", "Give one concrete tactic the leading brand should protect to maintain its sentiment advantage, and one the trailing brand should adopt immediately."],
+  "engagement_chart_insight": ["State the exact followers, total engagement, and avg likes values for both brands from the chart.", "Calculate the engagement-per-follower rate for each brand (total_engagement ÷ followers) and compare them — this reveals content quality independent of audience size.", "Explain what the gap between the followers differential and the engagement differential reveals — is the leader winning on reach, content resonance, or both?", "Analyse avg likes per post as a proxy for per-content quality and what the gap signals about each brand's ability to create high-performing individual posts.", "Identify whether the trailing brand's gap is primarily a reach problem (needs more followers) or a content quality problem (needs better posts per given audience).", "Name the single most actionable lever for the trailing brand: is it posting frequency, content theme, format, or audience growth?"],
+  "wordcloud_insight": ["Identify the 3-4 dominant topic clusters visible in the word list and name the specific terms that anchor each cluster.", "Explain what these clusters reveal about what the audience cares about most or what content consistently attracts engagement.", "Flag any term whose presence is surprising or whose absence is a strategic gap — what is the audience talking about that the brands are ignoring?", "Identify one underserved conversation topic: a gap between what the audience discusses and what the brand content covers.", "Suggest one specific content angle or series concept to exploit that gap and capture uncontested audience attention."]
 }}
 
 Base every insight on the actual data provided. Reference specific numbers. If data is thin or coverage is partial, acknowledge the limitation and recommend a re-scan."""  # noqa: E501
 
+        # Chart 1: simple charts for LLM visual analysis (multimodal input)
+        sentiment_llm_img = _render_sentiment_chart_for_llm(
+            a.sentiment, b.sentiment, request.brand_a_name, request.brand_b_name
+        )
+        engagement_llm_img = _render_engagement_chart_for_llm(
+            a, b, request.brand_a_name, request.brand_b_name
+        )
+
         response = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0, "max_output_tokens": 4096},
+            [sentiment_llm_img, engagement_llm_img, prompt],
+            generation_config={"temperature": 0, "max_output_tokens": 65536},
         )
         raw = response.text.strip()
 
-
         data = _extract_json(raw)
 
-
-        sentiment_b64 = _render_sentiment_chart(a.sentiment, b.sentiment, request.brand_a_name, request.brand_b_name)
-        engagement_b64 = _render_engagement_chart(a, b, request.brand_a_name, request.brand_b_name)
-
+        # Chart 2: modern styled charts shown to the frontend
+        sentiment_b64 = _render_sentiment_chart_modern(
+            a.sentiment, b.sentiment, request.brand_a_name, request.brand_b_name
+        )
+        engagement_b64 = _render_engagement_chart_modern(
+            a, b, request.brand_a_name, request.brand_b_name
+        )
         wordcloud_b64 = _render_wordcloud_chart(request.top_terms)
         brand_a_wordcloud_b64 = _render_wordcloud_chart(request.brand_a_top_terms)
         brand_b_wordcloud_b64 = _render_wordcloud_chart(request.brand_b_top_terms)
@@ -552,6 +766,9 @@ Base every insight on the actual data provided. Reference specific numbers. If d
             risk_assessment=data.get("risk_assessment", []),
             growth_opportunities=data.get("growth_opportunities", []),
             recommendations=data.get("recommendations", []),
+            sentiment_chart_insight=data.get("sentiment_chart_insight", []),
+            engagement_chart_insight=data.get("engagement_chart_insight", []),
+            wordcloud_insight=data.get("wordcloud_insight", []),
             sentiment_chart_b64=sentiment_b64,
             engagement_chart_b64=engagement_b64,
             wordcloud_chart_b64=wordcloud_b64,
@@ -664,3 +881,448 @@ Return ONLY valid JSON (no markdown):
             topics=[], content_summary=f"Analysis unavailable: {str(e)}",
             patterns=[], recommendations=[],
         )
+
+
+# ---------------------------------------------------------------------------
+# Full agentic analysis — competitive + topic + vision charts in one call
+# ---------------------------------------------------------------------------
+
+class AnalysisRecommendation(BaseModel):
+    title: str
+    message: str
+    severity: str  # "high" | "medium" | "low" | "positive"
+
+
+class ChartItem(BaseModel):
+    title: str
+    image_base64: str
+    analysis: str
+
+
+class FullAnalysisRequest(BaseModel):
+    kalventis: AccountSnapshot
+    gsk: AccountSnapshot
+    top_topics: list[str] = []
+    news_count: int = 0
+    period: str = ""
+    top_words: list[str] = []
+    follower_ratio: float = 1.0
+    post_ratio: float = 1.0
+    posts: list[KalventisPost] = []
+
+
+class FullAnalysisResponse(BaseModel):
+    analysis_text: str
+    key_findings: list[str]
+    recommendations: list[AnalysisRecommendation]
+    risk_indicators: list[str]
+    opportunities: list[str]
+    topics: list[TopicItem]
+    content_summary: str
+    patterns: list[str]
+    content_recommendations: list[str]
+    charts: list[ChartItem]
+    created_at: str
+
+
+def _analyse_chart_vision(model: genai.GenerativeModel, b64: str, title: str) -> str:
+    try:
+        img = Image.open(io.BytesIO(base64.b64decode(b64)))
+        prompt = (
+            f"You are analyzing a '{title}' chart for Kalventis, an Indonesian vaccine brand's "
+            "social media analytics dashboard. In 2-3 concise sentences, describe the key insight "
+            "this chart reveals and what it means for the brand's content strategy."
+        )
+        return model.generate_content([prompt, img]).text.strip()
+    except Exception as e:
+        logger.error(f"Vision analysis failed for '{title}': {e}")
+        return ""
+
+
+@app.post("/api/v1/full-analysis")
+async def full_analysis(request: FullAnalysisRequest) -> FullAnalysisResponse:
+    if not GEMINI_API_KEY:
+        return FullAnalysisResponse(
+            analysis_text="Gemini API key not configured.",
+            key_findings=[], recommendations=[], risk_indicators=[], opportunities=[],
+            topics=[], content_summary="", patterns=[], content_recommendations=[],
+            charts=[], created_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+
+    kv = request.kalventis
+    gsk = request.gsk
+    kv_total = kv.sentiment.positive + kv.sentiment.neutral + kv.sentiment.negative
+    gsk_total = gsk.sentiment.positive + gsk.sentiment.neutral + gsk.sentiment.negative
+    kv_pos_rate = f"{(kv.sentiment.positive / max(1, kv_total) * 100):.1f}%"
+    gsk_pos_rate = f"{(gsk.sentiment.positive / max(1, gsk_total) * 100):.1f}%"
+
+    # --- Generate charts ---
+    sentiment_b64 = _render_sentiment_chart(kv.sentiment, gsk.sentiment, "Kalventis", "GSK")
+    engagement_b64 = _render_engagement_chart(kv, gsk, "Kalventis", "GSK")
+    wordcloud_b64 = _render_wordcloud_chart(request.top_words)
+
+    # --- Vision analysis for each chart ---
+    charts: list[ChartItem] = []
+    charts.append(ChartItem(
+        title="Sentiment Distribution",
+        image_base64=sentiment_b64,
+        analysis=_analyse_chart_vision(model, sentiment_b64, "Sentiment Distribution"),
+    ))
+    charts.append(ChartItem(
+        title="Engagement Metrics",
+        image_base64=engagement_b64,
+        analysis=_analyse_chart_vision(model, engagement_b64, "Engagement Metrics"),
+    ))
+    if wordcloud_b64:
+        charts.append(ChartItem(
+            title="Word Cloud",
+            image_base64=wordcloud_b64,
+            analysis=_analyse_chart_vision(model, wordcloud_b64, "Word Cloud"),
+        ))
+
+    # --- Competitive analysis ---
+    competitive_prompt = f"""You are a senior social media analyst for Kalventis, an Indonesian vaccine awareness brand.
+Analyze the following social listening data and respond ONLY in valid JSON (no markdown):
+
+KALVENTIS (@kenapaharusvaksin) — Owned: Followers {kv.followers:,} | Posts {kv.posts_scraped} | Avg likes {kv.avg_likes} | Engagement {kv.total_engagement:,} | Sentiment {kv_pos_rate} positive
+GSK (@ayokitavaksin) — Competitor: Followers {gsk.followers:,} | Posts {gsk.posts_scraped} | Avg likes {gsk.avg_likes} | Engagement {gsk.total_engagement:,} | Sentiment {gsk_pos_rate} positive
+Follower ratio: {request.follower_ratio:.1f}x | Post ratio: {request.post_ratio:.1f}x
+Topics: {', '.join(request.top_topics[:8]) or 'N/A'} | News monitored: {request.news_count}
+Top terms: {', '.join(request.top_words[:10]) or 'N/A'} | Period: {request.period}
+
+{{
+  "analysis_text": "3-4 paragraph markdown narrative covering competitive landscape, performance highlights, and strategic outlook",
+  "key_findings": ["concise finding 1", "finding 2", "finding 3", "finding 4"],
+  "recommendations": [
+    {{"title": "short title", "message": "actionable detail", "severity": "high|medium|low|positive"}},
+    {{"title": "...", "message": "...", "severity": "..."}},
+    {{"title": "...", "message": "...", "severity": "..."}},
+    {{"title": "...", "message": "...", "severity": "..."}}
+  ],
+  "risk_indicators": ["specific risk 1", "risk 2", "risk 3"],
+  "opportunities": ["growth opportunity 1", "opportunity 2", "opportunity 3"]
+}}"""
+
+    # --- Topic / content analysis ---
+    posts_text = "\n".join(
+        f"[{i+1}] {p.likes}L {p.comments}C — {p.caption[:120]}"
+        for i, p in enumerate(request.posts[:15])
+    ) or "No posts available"
+
+    topic_prompt = f"""Analyze @kenapaharusvaksin (Kalventis) Instagram posts. Respond ONLY in valid JSON (no markdown):
+
+{posts_text[:3500]}
+
+{{
+  "topics": [{{"name": "topic", "mentions": N, "momentum": "growing|steady|declining", "summary": "one sentence"}}],
+  "content_summary": "2-3 sentence content strategy assessment",
+  "patterns": ["engagement pattern 1", "pattern 2", "pattern 3", "pattern 4"],
+  "content_recommendations": ["actionable recommendation 1", "2", "3", "4"]
+}}"""
+
+    comp_data: dict = {}
+    topic_data: dict = {}
+
+    try:
+        comp_data = _extract_json(model.generate_content(competitive_prompt).text.strip())
+    except Exception as e:
+        logger.error(f"Competitive analysis error: {e}")
+        comp_data = {"analysis_text": f"Analysis unavailable: {e}", "key_findings": [],
+                     "recommendations": [], "risk_indicators": [], "opportunities": []}
+
+    try:
+        topic_data = _extract_json(model.generate_content(topic_prompt).text.strip())
+    except Exception as e:
+        logger.error(f"Topic analysis error: {e}")
+        topic_data = {"topics": [], "content_summary": "", "patterns": [], "content_recommendations": []}
+
+    topics = [
+        TopicItem(name=t.get("name", ""), mentions=t.get("mentions", 0),
+                  momentum=t.get("momentum", "steady"), summary=t.get("summary", ""))
+        for t in topic_data.get("topics", [])
+    ]
+
+    raw_recs = comp_data.get("recommendations", [])
+    recommendations = [
+        AnalysisRecommendation(
+            title=r.get("title", ""),
+            message=r.get("message", ""),
+            severity=r.get("severity", "low"),
+        )
+        for r in raw_recs if isinstance(r, dict)
+    ]
+
+    return FullAnalysisResponse(
+        analysis_text=comp_data.get("analysis_text", ""),
+        key_findings=comp_data.get("key_findings", []),
+        recommendations=recommendations,
+        risk_indicators=comp_data.get("risk_indicators", []),
+        opportunities=comp_data.get("opportunities", []),
+        topics=topics,
+        content_summary=topic_data.get("content_summary", ""),
+        patterns=topic_data.get("patterns", []),
+        content_recommendations=topic_data.get("content_recommendations", []),
+        charts=charts,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat endpoint — conversational Q&A with social listening context
+# ---------------------------------------------------------------------------
+
+class ChatMessage(BaseModel):
+    role: str    # "user" | "assistant"
+    content: str
+
+
+class SocialListeningContext(BaseModel):
+    kalventis_followers: int = 0
+    kalventis_posts: int = 0
+    kalventis_avg_likes: int = 0
+    kalventis_total_engagement: int = 0
+    kalventis_sentiment: dict = {}
+    gsk_followers: int = 0
+    gsk_posts: int = 0
+    gsk_avg_likes: int = 0
+    gsk_total_engagement: int = 0
+    gsk_sentiment: dict = {}
+    top_topics: list[str] = []
+    top_words: list[str] = []
+    news_count: int = 0
+    follower_ratio: float = 1.0
+    post_ratio: float = 1.0
+    period: str = ""
+
+
+class SocialChatRequest(BaseModel):
+    message: str
+    history: list[ChatMessage] = []
+    context: SocialListeningContext | None = None
+
+
+class SocialChatResponse(BaseModel):
+    response: str
+
+
+@app.post("/api/v1/chat")
+async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
+    if not GEMINI_API_KEY:
+        return SocialChatResponse(response="Gemini API key not configured.")
+
+    ctx = request.context
+    if ctx:
+        kv_sent = ctx.kalventis_sentiment
+        gsk_sent = ctx.gsk_sentiment
+        context_block = (
+            "You are an expert social media analyst assistant for Kalventis, "
+            "an Indonesian vaccine awareness brand (@kenapaharusvaksin).\n"
+            "You have access to the following real-time social listening dashboard data:\n\n"
+            "=== KALVENTIS (@kenapaharusvaksin) ===\n"
+            f"Followers: {ctx.kalventis_followers:,}\n"
+            f"Posts scraped: {ctx.kalventis_posts}\n"
+            f"Avg likes/post: {ctx.kalventis_avg_likes}\n"
+            f"Total engagement: {ctx.kalventis_total_engagement:,}\n"
+            f"Sentiment: {kv_sent.get('positive', 0)} positive / "
+            f"{kv_sent.get('neutral', 0)} neutral / {kv_sent.get('negative', 0)} negative\n\n"
+            "=== GSK COMPETITOR (@ayokitavaksin) ===\n"
+            f"Followers: {ctx.gsk_followers:,}\n"
+            f"Posts scraped: {ctx.gsk_posts}\n"
+            f"Avg likes/post: {ctx.gsk_avg_likes}\n"
+            f"Total engagement: {ctx.gsk_total_engagement:,}\n"
+            f"Sentiment: {gsk_sent.get('positive', 0)} positive / "
+            f"{gsk_sent.get('neutral', 0)} neutral / {gsk_sent.get('negative', 0)} negative\n\n"
+            "=== COMPETITIVE POSITION ===\n"
+            f"Follower ratio: Kalventis is {ctx.follower_ratio:.1f}x larger\n"
+            f"Post ratio: Kalventis is {ctx.post_ratio:.1f}x more active\n"
+            f"Period: {ctx.period}\n\n"
+            "=== MARKET CONTEXT ===\n"
+            f"Active topics: {', '.join(ctx.top_topics[:8]) or 'None'}\n"
+            f"Top mentioned words: {', '.join(ctx.top_words[:12]) or 'None'}\n"
+            f"News articles monitored: {ctx.news_count}\n\n"
+            "Answer questions concisely and practically based on this data. "
+            "Use bullet points where helpful. Be specific with numbers when relevant."
+        )
+        context_data = {
+            "brand_a_name": "Kalventis",
+            "brand_b_name": "GSK",
+            "brand_a": {
+                "followers": ctx.kalventis_followers,
+                "posts_scraped": ctx.kalventis_posts,
+                "avg_likes": ctx.kalventis_avg_likes,
+                "total_engagement": ctx.kalventis_total_engagement,
+                "sentiment": kv_sent,
+            },
+            "brand_b": {
+                "followers": ctx.gsk_followers,
+                "posts_scraped": ctx.gsk_posts,
+                "avg_likes": ctx.gsk_avg_likes,
+                "total_engagement": ctx.gsk_total_engagement,
+                "sentiment": gsk_sent,
+            },
+        }
+        context_meta = {
+            "period": ctx.period,
+            "brand_a_name": "Kalventis",
+            "brand_b_name": "GSK",
+        }
+    else:
+        context_block = (
+            "You are a social media analyst assistant for Kalventis, an Indonesian vaccine "
+            "awareness brand. Answer questions about social media strategy, vaccine content, "
+            "and competitive analysis."
+        )
+        context_data = {}
+        context_meta = {"period": "current period", "brand_a_name": "Kalventis", "brand_b_name": "GSK"}
+
+    history = [{"role": m.role, "content": m.content} for m in request.history]
+
+    try:
+        response_text = run_agentic_chat(
+            message=request.message,
+            history=history,
+            context_block=context_block,
+            context_data=context_data,
+            context_meta=context_meta,
+        )
+        return SocialChatResponse(response=response_text)
+    except Exception as e:
+        logger.error(f"Agentic chat error: {e}")
+        return SocialChatResponse(response="Sorry, I couldn't process your question. Please try again.")
+
+
+# ---------------------------------------------------------------------------
+# Monitoring chat — conversational Q&A grounded in a monitoring scan result
+# ---------------------------------------------------------------------------
+
+class MonitoringChatContext(BaseModel):
+    brand_a_name: str = ""
+    brand_a_username: str = ""
+    brand_b_name: str = ""
+    brand_b_username: str = ""
+    brand_a: AccountSnapshot = AccountSnapshot()
+    brand_b: AccountSnapshot = AccountSnapshot()
+    comparison: dict = {}
+    top_terms: list[str] = []
+    top_posts: list[dict] = []
+    top_comments: list[dict] = []
+    coverage: dict = {}
+    period: str = ""
+
+
+class MonitoringChatRequest(BaseModel):
+    message: str
+    history: list[ChatMessage] = []
+    context: MonitoringChatContext | None = None
+
+
+@app.post("/api/v1/monitoring/chat")
+async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
+    if not GEMINI_API_KEY:
+        return SocialChatResponse(response="Gemini API key not configured.")
+
+    ctx = request.context
+    if ctx:
+        a = ctx.brand_a
+        b = ctx.brand_b
+        comp = ctx.comparison
+        a_total = max(1, a.sentiment.positive + a.sentiment.neutral + a.sentiment.negative)
+        b_total = max(1, b.sentiment.positive + b.sentiment.neutral + b.sentiment.negative)
+
+        posts_text = "\n".join(
+            f"  [{p.get('side','')}] @{p.get('username','')}: "
+            f"\"{str(p.get('caption',''))[:150]}\" — {p.get('engagement',0)} eng, {p.get('sentiment','Neutral')}"
+            for p in ctx.top_posts[:8]
+        ) or "  No post samples available."
+
+        comments_text = "\n".join(
+            f"  [{c.get('side','')}] @{c.get('ownerUsername','')}: \"{str(c.get('text',''))[:150]}\""
+            for c in ctx.top_comments[:6]
+        ) or "  No comment samples available."
+
+        context_block = (
+            "You are an expert social media competitive intelligence analyst.\n"
+            "You have full access to the monitoring scan data below. Answer every question "
+            "by referencing specific numbers from this data. Use bullet points where helpful. "
+            "Be concise and actionable.\n\n"
+            f"=== {ctx.brand_a_name} (@{ctx.brand_a_username}) ===\n"
+            f"Followers: {a.followers:,}\n"
+            f"Posts scraped: {a.posts_scraped}\n"
+            f"Avg likes / post: {a.avg_likes:,}\n"
+            f"Total engagement: {a.total_engagement:,}\n"
+            f"Sentiment: {a.sentiment.positive} positive ({a.sentiment.positive/a_total*100:.0f}%) / "
+            f"{a.sentiment.neutral} neutral ({a.sentiment.neutral/a_total*100:.0f}%) / "
+            f"{a.sentiment.negative} negative ({a.sentiment.negative/a_total*100:.0f}%)\n\n"
+            f"=== {ctx.brand_b_name} (@{ctx.brand_b_username}) ===\n"
+            f"Followers: {b.followers:,}\n"
+            f"Posts scraped: {b.posts_scraped}\n"
+            f"Avg likes / post: {b.avg_likes:,}\n"
+            f"Total engagement: {b.total_engagement:,}\n"
+            f"Sentiment: {b.sentiment.positive} positive ({b.sentiment.positive/b_total*100:.0f}%) / "
+            f"{b.sentiment.neutral} neutral ({b.sentiment.neutral/b_total*100:.0f}%) / "
+            f"{b.sentiment.negative} negative ({b.sentiment.negative/b_total*100:.0f}%)\n\n"
+            "=== COMPETITIVE COMPARISON ===\n"
+            f"Total engagement (both brands): {comp.get('engagementTotal', 0):,}\n"
+            f"{ctx.brand_a_name} engagement share: {comp.get('brandAEngagementShare', 0)}%\n"
+            f"{ctx.brand_b_name} engagement share: {comp.get('brandBEngagementShare', 0)}%\n"
+            f"{ctx.brand_a_name} post share: {comp.get('brandAPostShare', 0)}%\n"
+            f"{ctx.brand_b_name} post share: {comp.get('brandBPostShare', 0)}%\n\n"
+            "=== TOP CONTENT THEMES ===\n"
+            f"{', '.join(ctx.top_terms[:15]) or 'Not available'}\n\n"
+            "=== TOP POSTS (by engagement) ===\n"
+            f"{posts_text}\n\n"
+            "=== AUDIENCE COMMENTS SAMPLE ===\n"
+            f"{comments_text}\n\n"
+            "=== COVERAGE ===\n"
+            f"Status: {ctx.coverage.get('status', 'unknown')} · Score: {ctx.coverage.get('score', 'N/A')}%\n"
+            f"Note: {ctx.coverage.get('coverageNote', '')}\n\n"
+            f"Period: {ctx.period or 'Recent scan'}"
+        )
+        context_data = {
+            "brand_a_name": ctx.brand_a_name or "Brand A",
+            "brand_b_name": ctx.brand_b_name or "Brand B",
+            "brand_a": {
+                "followers": a.followers,
+                "posts_scraped": a.posts_scraped,
+                "avg_likes": a.avg_likes,
+                "total_engagement": a.total_engagement,
+                "sentiment": a.sentiment,
+            },
+            "brand_b": {
+                "followers": b.followers,
+                "posts_scraped": b.posts_scraped,
+                "avg_likes": b.avg_likes,
+                "total_engagement": b.total_engagement,
+                "sentiment": b.sentiment,
+            },
+        }
+        context_meta = {
+            "period": ctx.period or "Recent scan",
+            "brand_a_name": ctx.brand_a_name or "Brand A",
+            "brand_b_name": ctx.brand_b_name or "Brand B",
+        }
+    else:
+        context_block = (
+            "You are a social media competitive intelligence analyst. "
+            "Answer questions about social media strategy and competitive analysis."
+        )
+        context_data = {}
+        context_meta = {"period": "current period", "brand_a_name": "Brand A", "brand_b_name": "Brand B"}
+
+    history = [{"role": m.role, "content": m.content} for m in request.history]
+
+    try:
+        response_text = run_agentic_chat(
+            message=request.message,
+            history=history,
+            context_block=context_block,
+            context_data=context_data,
+            context_meta=context_meta,
+        )
+        return SocialChatResponse(response=response_text)
+    except Exception as e:
+        logger.error(f"Agentic monitoring chat error: {e}")
+        return SocialChatResponse(response="Sorry, I couldn't process your question. Please try again.")
