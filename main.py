@@ -6,12 +6,13 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import google.generativeai as genai
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import base64
 import io
@@ -40,6 +41,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 _sentiment_pipeline = None
 _sentiment_lock = asyncio.Lock()
+_sentiment_warmup_task: asyncio.Task | None = None
 # Use the git-cloned path when running in Docker, HuggingFace hub otherwise
 _INDOBERT_MODEL = (
     "/indonesia-bert-sentiment-classification"
@@ -47,13 +49,21 @@ _INDOBERT_MODEL = (
     else "mdhugol/indonesia-bert-sentiment-classification"
 )
 _LABEL_MAP = {"LABEL_0": "Positive", "LABEL_1": "Neutral", "LABEL_2": "Negative"}
+_SENTIMENT_MAX_BATCH = int(os.getenv("SENTIMENT_MAX_BATCH", "100"))
+_SENTIMENT_MAX_CHARS = int(os.getenv("SENTIMENT_MAX_CHARS", "2048"))
+_SENTIMENT_INFERENCE_CHARS = int(os.getenv("SENTIMENT_INFERENCE_CHARS", "512"))
+_SENTIMENT_BATCH_SIZE = int(os.getenv("SENTIMENT_BATCH_SIZE", "16"))
+_TORCH_NUM_THREADS = int(os.getenv("TORCH_NUM_THREADS", "1"))
 
 
 def _load_indobert_sync():
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+    import torch
+    torch.set_num_threads(_TORCH_NUM_THREADS)
     tokenizer = AutoTokenizer.from_pretrained(_INDOBERT_MODEL)
     model = AutoModelForSequenceClassification.from_pretrained(_INDOBERT_MODEL)
-    return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
+    model.eval()
+    return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
 
 
 async def _get_sentiment_pipeline():
@@ -69,9 +79,18 @@ async def _get_sentiment_pipeline():
     return _sentiment_pipeline
 
 
+def _log_sentiment_warmup_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except Exception:
+        logger.exception("IndoBERT warmup failed.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(_get_sentiment_pipeline())
+    global _sentiment_warmup_task
+    _sentiment_warmup_task = asyncio.create_task(_get_sentiment_pipeline())
+    _sentiment_warmup_task.add_done_callback(_log_sentiment_warmup_result)
     yield
 
 
@@ -1381,8 +1400,11 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
 # IndoBERT batch sentiment classification endpoint
 # ---------------------------------------------------------------------------
 
+SentimentText = Annotated[str, Field(max_length=_SENTIMENT_MAX_CHARS)]
+
+
 class SentimentRequest(BaseModel):
-    texts: list[str]
+    texts: list[SentimentText] = Field(default_factory=list, max_length=_SENTIMENT_MAX_BATCH)
 
 
 class SentimentResult(BaseModel):
@@ -1403,23 +1425,31 @@ async def classify_sentiment(request: SentimentRequest) -> SentimentResponse:
         pipe = await _get_sentiment_pipeline()
 
         def _run_inference() -> list[dict]:
-            out = []
-            for text in request.texts:
+            out: list[dict | None] = [None] * len(request.texts)
+            indexed_texts: list[tuple[int, str]] = []
+            for index, text in enumerate(request.texts):
                 if not text or not text.strip():
-                    out.append({"label": "Neutral", "score": 1.0})
+                    out[index] = {"label": "Neutral", "score": 1.0}
                     continue
-                result = pipe(text[:512])[0]
-                out.append({
-                    "label": _LABEL_MAP.get(result["label"], "Neutral"),
-                    "score": float(result["score"]),
-                })
-            return out
+                indexed_texts.append((index, text[:_SENTIMENT_INFERENCE_CHARS]))
+
+            if indexed_texts:
+                results = pipe(
+                    [text for _, text in indexed_texts],
+                    batch_size=_SENTIMENT_BATCH_SIZE,
+                    truncation=True,
+                    max_length=_SENTIMENT_INFERENCE_CHARS,
+                )
+                for (index, _), result in zip(indexed_texts, results):
+                    out[index] = {
+                        "label": _LABEL_MAP.get(result["label"], "Neutral"),
+                        "score": float(result["score"]),
+                    }
+            return [item or {"label": "Neutral", "score": 0.0} for item in out]
 
         raw = await asyncio.to_thread(_run_inference)
         return SentimentResponse(results=[SentimentResult(**r) for r in raw])
 
     except Exception as e:
         logger.error(f"Sentiment classification error: {e}")
-        return SentimentResponse(
-            results=[SentimentResult(label="Neutral", score=0.5) for _ in request.texts]
-        )
+        raise HTTPException(status_code=503, detail="Sentiment model unavailable") from e
