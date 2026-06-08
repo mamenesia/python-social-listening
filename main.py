@@ -1,9 +1,11 @@
 """Social Listening AI Analysis API — Python backend for LLM-powered insights."""
 
+import asyncio
 import json
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -32,7 +34,48 @@ from agentic_chat import run_agentic_chat  # noqa: E402
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-app = FastAPI(title="Social Listening AI Analysis API", version="1.0.0")
+# ---------------------------------------------------------------------------
+# IndoBERT sentiment model — lazy-loaded on first request
+# ---------------------------------------------------------------------------
+
+_sentiment_pipeline = None
+_sentiment_lock = asyncio.Lock()
+# Use the git-cloned path when running in Docker, HuggingFace hub otherwise
+_INDOBERT_MODEL = (
+    "/indonesia-bert-sentiment-classification"
+    if os.path.isdir("/indonesia-bert-sentiment-classification")
+    else "mdhugol/indonesia-bert-sentiment-classification"
+)
+_LABEL_MAP = {"LABEL_0": "Positive", "LABEL_1": "Neutral", "LABEL_2": "Negative"}
+
+
+def _load_indobert_sync():
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+    tokenizer = AutoTokenizer.from_pretrained(_INDOBERT_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(_INDOBERT_MODEL)
+    return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
+
+
+async def _get_sentiment_pipeline():
+    global _sentiment_pipeline
+    if _sentiment_pipeline is not None:
+        return _sentiment_pipeline
+    async with _sentiment_lock:
+        if _sentiment_pipeline is not None:
+            return _sentiment_pipeline
+        logger.info("Loading IndoBERT sentiment model…")
+        _sentiment_pipeline = await asyncio.to_thread(_load_indobert_sync)
+        logger.info("IndoBERT model ready.")
+    return _sentiment_pipeline
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(_get_sentiment_pipeline())
+    yield
+
+
+app = FastAPI(title="Social Listening AI Analysis API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1332,3 +1375,51 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
     except Exception as e:
         logger.error(f"Agentic monitoring chat error: {e}")
         return SocialChatResponse(response="Sorry, I couldn't process your question. Please try again.")
+
+
+# ---------------------------------------------------------------------------
+# IndoBERT batch sentiment classification endpoint
+# ---------------------------------------------------------------------------
+
+class SentimentRequest(BaseModel):
+    texts: list[str]
+
+
+class SentimentResult(BaseModel):
+    label: str   # "Positive" | "Neutral" | "Negative"
+    score: float
+
+
+class SentimentResponse(BaseModel):
+    results: list[SentimentResult]
+
+
+@app.post("/api/v1/sentiment")
+async def classify_sentiment(request: SentimentRequest) -> SentimentResponse:
+    if not request.texts:
+        return SentimentResponse(results=[])
+
+    try:
+        pipe = await _get_sentiment_pipeline()
+
+        def _run_inference() -> list[dict]:
+            out = []
+            for text in request.texts:
+                if not text or not text.strip():
+                    out.append({"label": "Neutral", "score": 1.0})
+                    continue
+                result = pipe(text[:512])[0]
+                out.append({
+                    "label": _LABEL_MAP.get(result["label"], "Neutral"),
+                    "score": float(result["score"]),
+                })
+            return out
+
+        raw = await asyncio.to_thread(_run_inference)
+        return SentimentResponse(results=[SentimentResult(**r) for r in raw])
+
+    except Exception as e:
+        logger.error(f"Sentiment classification error: {e}")
+        return SentimentResponse(
+            results=[SentimentResult(label="Neutral", score=0.5) for _ in request.texts]
+        )
