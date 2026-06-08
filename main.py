@@ -1,15 +1,18 @@
 """Social Listening AI Analysis API — Python backend for LLM-powered insights."""
 
+import asyncio
 import json
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
+from typing import Annotated
 
 import google.generativeai as genai
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import base64
 import io
@@ -32,7 +35,66 @@ from agentic_chat import run_agentic_chat  # noqa: E402
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-app = FastAPI(title="Social Listening AI Analysis API", version="1.0.0")
+# ---------------------------------------------------------------------------
+# IndoBERT sentiment model — lazy-loaded on first request
+# ---------------------------------------------------------------------------
+
+_sentiment_pipeline = None
+_sentiment_lock = asyncio.Lock()
+_sentiment_warmup_task: asyncio.Task | None = None
+# Use the git-cloned path when running in Docker, HuggingFace hub otherwise
+_INDOBERT_MODEL = (
+    "/indonesia-bert-sentiment-classification"
+    if os.path.isdir("/indonesia-bert-sentiment-classification")
+    else "mdhugol/indonesia-bert-sentiment-classification"
+)
+_LABEL_MAP = {"LABEL_0": "Positive", "LABEL_1": "Neutral", "LABEL_2": "Negative"}
+_SENTIMENT_MAX_BATCH = int(os.getenv("SENTIMENT_MAX_BATCH", "100"))
+_SENTIMENT_MAX_CHARS = int(os.getenv("SENTIMENT_MAX_CHARS", "2048"))
+_SENTIMENT_INFERENCE_CHARS = int(os.getenv("SENTIMENT_INFERENCE_CHARS", "512"))
+_SENTIMENT_BATCH_SIZE = int(os.getenv("SENTIMENT_BATCH_SIZE", "16"))
+_TORCH_NUM_THREADS = int(os.getenv("TORCH_NUM_THREADS", "1"))
+
+
+def _load_indobert_sync():
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+    import torch
+    torch.set_num_threads(_TORCH_NUM_THREADS)
+    tokenizer = AutoTokenizer.from_pretrained(_INDOBERT_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(_INDOBERT_MODEL)
+    model.eval()
+    return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
+
+
+async def _get_sentiment_pipeline():
+    global _sentiment_pipeline
+    if _sentiment_pipeline is not None:
+        return _sentiment_pipeline
+    async with _sentiment_lock:
+        if _sentiment_pipeline is not None:
+            return _sentiment_pipeline
+        logger.info("Loading IndoBERT sentiment model…")
+        _sentiment_pipeline = await asyncio.to_thread(_load_indobert_sync)
+        logger.info("IndoBERT model ready.")
+    return _sentiment_pipeline
+
+
+def _log_sentiment_warmup_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except Exception:
+        logger.exception("IndoBERT warmup failed.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _sentiment_warmup_task
+    _sentiment_warmup_task = asyncio.create_task(_get_sentiment_pipeline())
+    _sentiment_warmup_task.add_done_callback(_log_sentiment_warmup_result)
+    yield
+
+
+app = FastAPI(title="Social Listening AI Analysis API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1332,3 +1394,62 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
     except Exception as e:
         logger.error(f"Agentic monitoring chat error: {e}")
         return SocialChatResponse(response="Sorry, I couldn't process your question. Please try again.")
+
+
+# ---------------------------------------------------------------------------
+# IndoBERT batch sentiment classification endpoint
+# ---------------------------------------------------------------------------
+
+SentimentText = Annotated[str, Field(max_length=_SENTIMENT_MAX_CHARS)]
+
+
+class SentimentRequest(BaseModel):
+    texts: list[SentimentText] = Field(default_factory=list, max_length=_SENTIMENT_MAX_BATCH)
+
+
+class SentimentResult(BaseModel):
+    label: str   # "Positive" | "Neutral" | "Negative"
+    score: float
+
+
+class SentimentResponse(BaseModel):
+    results: list[SentimentResult]
+
+
+@app.post("/api/v1/sentiment")
+async def classify_sentiment(request: SentimentRequest) -> SentimentResponse:
+    if not request.texts:
+        return SentimentResponse(results=[])
+
+    try:
+        pipe = await _get_sentiment_pipeline()
+
+        def _run_inference() -> list[dict]:
+            out: list[dict | None] = [None] * len(request.texts)
+            indexed_texts: list[tuple[int, str]] = []
+            for index, text in enumerate(request.texts):
+                if not text or not text.strip():
+                    out[index] = {"label": "Neutral", "score": 1.0}
+                    continue
+                indexed_texts.append((index, text[:_SENTIMENT_INFERENCE_CHARS]))
+
+            if indexed_texts:
+                results = pipe(
+                    [text for _, text in indexed_texts],
+                    batch_size=_SENTIMENT_BATCH_SIZE,
+                    truncation=True,
+                    max_length=_SENTIMENT_INFERENCE_CHARS,
+                )
+                for (index, _), result in zip(indexed_texts, results):
+                    out[index] = {
+                        "label": _LABEL_MAP.get(result["label"], "Neutral"),
+                        "score": float(result["score"]),
+                    }
+            return [item or {"label": "Neutral", "score": 0.0} for item in out]
+
+        raw = await asyncio.to_thread(_run_inference)
+        return SentimentResponse(results=[SentimentResult(**r) for r in raw])
+
+    except Exception as e:
+        logger.error(f"Sentiment classification error: {e}")
+        raise HTTPException(status_code=503, detail="Sentiment model unavailable") from e

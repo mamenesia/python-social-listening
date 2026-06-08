@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 .env
+
+# HuggingFace model cache (locally downloaded models)
+.cache/
+hf_cache/
+indonesia-bert-sentiment-classification/
