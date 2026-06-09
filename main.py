@@ -57,23 +57,20 @@ _TORCH_NUM_THREADS = int(os.getenv("TORCH_NUM_THREADS", "1"))
 
 
 def _load_indobert_sync():
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
     import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
     torch.set_num_threads(_TORCH_NUM_THREADS)
     tokenizer = AutoTokenizer.from_pretrained(_INDOBERT_MODEL)
+    # PyTorch 2.6 changed weights_only default True, breaking legacy .bin checkpoints.
+    # Patch torch.load directly — works regardless of transformers version.
+    _orig_load = torch.load
+    torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "weights_only": False})
     try:
-        # This service uses a fixed, trusted IndoBERT checkpoint. PyTorch 2.6
-        # defaults torch.load(weights_only=True), which rejects this legacy
-        # HuggingFace .bin checkpoint with "Unsupported operand 118".
-        model = AutoModelForSequenceClassification.from_pretrained(
-            _INDOBERT_MODEL,
-            weights_only=False,
-        )
-    except TypeError:
-        # Older transformers versions do not expose the weights_only argument.
         model = AutoModelForSequenceClassification.from_pretrained(_INDOBERT_MODEL)
-    model.eval()
-    return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
+        model.eval()
+        return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
+    finally:
+        torch.load = _orig_load
 
 
 async def _get_sentiment_pipeline():
