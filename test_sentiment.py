@@ -88,3 +88,39 @@ def test_sentiment_returns_503_when_model_unavailable(monkeypatch):
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Sentiment model unavailable"}
+
+
+def test_indobert_loader_allows_trusted_legacy_checkpoint(monkeypatch):
+    calls = []
+
+    class FakeTokenizer:
+        @staticmethod
+        def from_pretrained(model_name):
+            return "tokenizer"
+
+    class FakeModel:
+        @staticmethod
+        def from_pretrained(model_name, **kwargs):
+            calls.append((model_name, kwargs))
+            return FakeModel()
+
+        def eval(self):
+            calls.append(("eval", {}))
+
+    def fake_pipeline(task, **kwargs):
+        calls.append((task, kwargs))
+        return "pipeline"
+
+    transformers_stub = types.ModuleType("transformers")
+    transformers_stub.AutoTokenizer = FakeTokenizer
+    transformers_stub.AutoModelForSequenceClassification = FakeModel
+    transformers_stub.pipeline = fake_pipeline
+
+    torch_stub = types.ModuleType("torch")
+    torch_stub.set_num_threads = lambda threads: calls.append(("threads", {"threads": threads}))
+
+    monkeypatch.setitem(sys.modules, "transformers", transformers_stub)
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+
+    assert main._load_indobert_sync() == "pipeline"
+    assert (main._INDOBERT_MODEL, {"weights_only": False}) in calls
