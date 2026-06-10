@@ -1,10 +1,10 @@
-"""Agentic chat for Social Listening — LangGraph + Tavily web search + pandas visualization."""
+"""Agentic chat for Social Listening — LangGraph routing + LangChain Python Agent for visualization."""
 
 import base64
-import concurrent.futures
 import io
 import logging
 import os
+import re
 from typing import Optional, TypedDict
 
 import matplotlib
@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
 load_dotenv()
@@ -37,15 +37,18 @@ class AgenticChatState(TypedDict):
     final_answer: str
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── LLM ─────────────────────────────────────────────────────────────────────
 
-def _llm() -> ChatGoogleGenerativeAI:
-    return ChatGoogleGenerativeAI(
-        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+def _llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         temperature=0,
-        google_api_key=os.getenv("GEMINI_API_KEY", ""),
+        api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+        base_url="https://api.deepseek.com",
     )
 
+
+# ─── DataFrame builder ───────────────────────────────────────────────────────
 
 def _build_df(context_data: dict) -> pd.DataFrame:
     rows = []
@@ -89,7 +92,7 @@ WEB_QUERY: short search query or none
 Rules:
 - NEEDS_WEB_SEARCH = yes → question requires current news, external trends, recent events, or facts outside the internal social media metrics dashboard
 - NEEDS_VISUALIZATION = yes → user explicitly requests a chart, graph, plot, or visual
-- WEB_QUERY → 5–8 word search query if web needed, otherwise "none"
+- WEB_QUERY → 5–8 word search query if web search needed, otherwise "none"
 """
     result = llm.invoke(prompt)
     content = result.content.strip()
@@ -110,7 +113,7 @@ Rules:
             web_query = val
 
     logger.info(
-        "[agentic_chat] ✔ classify_intent | web_search=%s  visualization=%s  query=%r",
+        "[agentic_chat] ✔ classify_intent | web=%s viz=%s query=%r",
         needs_web, needs_viz, web_query,
     )
     return {**state, "needs_web_search": needs_web, "needs_visualization": needs_viz, "web_query": web_query}
@@ -122,7 +125,7 @@ def web_search_node(state: AgenticChatState) -> AgenticChatState:
     logger.info("[agentic_chat] ▶ web_search | query: %r", state["web_query"])
     api_key = os.getenv("TAVILY_API_KEY", "")
     if not api_key:
-        logger.warning("[agentic_chat] ✘ web_search | TAVILY_API_KEY not set — skipping")
+        logger.warning("[agentic_chat] ✘ web_search | TAVILY_API_KEY not set")
         return {**state, "web_results": []}
     try:
         os.environ["TAVILY_API_KEY"] = api_key
@@ -136,117 +139,98 @@ def web_search_node(state: AgenticChatState) -> AgenticChatState:
             }
             for r in raw[:4]
         ]
-        logger.info("[agentic_chat] ✔ web_search | got %d results", len(results))
+        logger.info("[agentic_chat] ✔ web_search | %d results", len(results))
         return {**state, "web_results": results}
     except Exception as e:
-        logger.error("[agentic_chat] ✘ web_search | error: %s", e)
+        logger.error("[agentic_chat] ✘ web_search | %s", e)
         return {**state, "web_results": []}
 
 
-# ─── Node: visualize ─────────────────────────────────────────────────────────
-
-def _extract_code(raw: str) -> Optional[str]:
-    start = raw.find("```python")
-    if start == -1:
-        return None
-    start += len("```python")
-    end = raw.find("```", start)
-    if end == -1:
-        return None
-    return raw[start:end].strip()
-
-
-def _exec_chart(code: str, df: pd.DataFrame) -> str:
-    """exec() the code and return base64 PNG. Pre-injects fig/ax so Gemini never hits NameError."""
-    # Pre-create fig and ax — Gemini can use them without defining, or redefine if needed
-    fig, ax = plt.subplots(figsize=(8, 5))
-    fig.patch.set_facecolor("#ffffff")
-    ax.set_facecolor("#f8f9fc")
-    env = {"pd": pd, "df": df, "plt": plt, "io": io, "base64": base64, "fig": fig, "ax": ax}
-    exec(code, {}, env)  # nosec — controlled internal use only
-    # Use result if it's a Figure, otherwise fall back to the pre-created fig
-    out_fig = env.get("result")
-    if not isinstance(out_fig, plt.Figure):
-        out_fig = fig
-    buf = io.BytesIO()
-    out_fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-    buf.seek(0)
-    viz_b64 = base64.b64encode(buf.read()).decode()
-    plt.close("all")
-    return viz_b64
-
-
-def _generate_chart(llm, df: pd.DataFrame, message: str) -> Optional[str]:
-    """Ask Gemini to generate matplotlib code, exec() it."""
-    prompt = f"""You are a Python data visualization expert.
-
-DataFrame `df` is already loaded with social media brand metrics:
-Columns: {list(df.columns)}
-Data:
-{df.to_string(index=False)}
-
-Write Python matplotlib code for: "{message}"
-
-These variables are PRE-CREATED — use them directly, do NOT redefine with plt.subplots():
-  fig  → matplotlib Figure (figsize 8×5, white background)
-  ax   → matplotlib Axes (light grey background)
-  df   → the DataFrame above
-  plt  → matplotlib.pyplot (Agg backend, already imported)
-
-STYLING:
-- Brand colors: '#2557d6' for first brand, '#12a594' for second
-- bars/wedges alpha=0.88
-- ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
-- Add value labels on bars/slices
-- ax.set_title(..., fontsize=14, fontweight='bold', color='#111827')
-- Do NOT call plt.show() or plt.subplots()
-- Set result = fig at the end
-
-Return ONLY a ```python ... ``` code block, no explanations."""
-
-    response = llm.invoke(prompt)
-    code = _extract_code(response.content.strip())
-    if not code:
-        logger.warning("[agentic_chat] ✘ visualize | no code block in LLM response")
-        return None
-
-    logger.info("[agentic_chat]   visualize | executing code (%d chars)", len(code))
-    try:
-        return _exec_chart(code, df)
-    except Exception as e:
-        logger.warning("[agentic_chat] ✘ visualize | exec failed: %s", e)
-        plt.close("all")
-        return None
-
+# ─── Node: visualize — code-gen + exec ───────────────────────────────────────
 
 def visualize_node(state: AgenticChatState) -> AgenticChatState:
     logger.info("[agentic_chat] ▶ visualize | request: %r", state["message"])
+
     if not state.get("context_data") or not state["context_data"].get("brand_a"):
-        logger.warning("[agentic_chat] ✘ visualize | no context_data available")
+        logger.warning("[agentic_chat] ✘ visualize | no context_data")
         return {**state, "viz_b64": None}
 
     try:
-        llm = _llm()
         df = _build_df(state["context_data"])
-        logger.info("[agentic_chat]   visualize | DataFrame shape: %s, brands: %s", df.shape, df["brand"].tolist())
+        logger.info("[agentic_chat]   df | brands=%s", df["brand"].tolist())
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_generate_chart, llm, df, state["message"])
+        # Step 1: ask DeepSeek to write the chart code
+        brands = df["brand"].tolist()
+        code_prompt = (
+            "You are a Python data visualization expert.\n"
+            "Write matplotlib code to fulfill the user's chart request.\n\n"
+            f"User request: {state['message']}\n\n"
+            "Pre-loaded variables (do NOT redefine them):\n"
+            "  plt  — matplotlib.pyplot\n"
+            "  pd   — pandas\n"
+            f"  df   — pandas DataFrame with integer index (0, 1, ...):\n"
+            f"    columns: {list(df.columns)}\n"
+            f"{df.to_string(index=True)}\n\n"
+            "IMPORTANT — correct data access patterns:\n"
+            f"  brands   = df['brand'].tolist()      # → {brands}\n"
+            f"  followers = df['followers'].tolist()  # → {df['followers'].tolist()}\n"
+            "  Do NOT use df.loc[brand_name, col] — the index is 0, 1, not brand names.\n"
+            "  Use df['column'].tolist() or df['column'].values to extract data.\n\n"
+            "Styling rules:\n"
+            "  - Figure size: fig, ax = plt.subplots(figsize=(7, 4))\n"
+            "  - Brand colors: '#2557d6' first brand, '#12a594' second brand\n"
+            "  - Remove top and right spines\n"
+            "  - Add value labels on bars\n"
+            "  - plt.tight_layout() before plt.show()\n"
+            "  - End with plt.show()\n\n"
+            "Output ONLY raw Python code — no markdown fences, no explanations.\n"
+        )
+        raw = _llm().invoke(code_prompt).content.strip()
+        code = re.sub(r"^```(?:python)?\n?", "", raw, flags=re.MULTILINE)
+        code = re.sub(r"\n?```\s*$", "", code, flags=re.MULTILINE).strip()
+        logger.info("[agentic_chat]   generated %d chars of code", len(code))
+        logger.debug("[agentic_chat]   code:\n%s", code)
+
+        # Step 2: exec the code; intercept plt.show() to capture the PNG
+        captured: list = []
+        _orig_show = plt.show
+
+        def _capture_show(*args, **kwargs):
             try:
-                viz_b64 = future.result(timeout=30)
-            except concurrent.futures.TimeoutError:
-                logger.warning("[agentic_chat] ✘ visualize | timed out after 30s — skipping chart")
-                viz_b64 = None
+                buf = io.BytesIO()
+                plt.savefig(buf, format="png", dpi=72, bbox_inches="tight")
+                buf.seek(0)
+                captured.append(base64.b64encode(buf.read()).decode())
+                logger.info("[agentic_chat] ✔ plt.show() captured")
+            except Exception as cap_err:
+                logger.warning("[agentic_chat] ✘ capture error: %s", cap_err)
+            finally:
+                plt.close("all")
 
-        if viz_b64 and len(viz_b64) > 100:
-            logger.info("[agentic_chat] ✔ visualize | chart captured (%d chars b64)", len(viz_b64))
+        plt.show = _capture_show
+        try:
+            exec(  # noqa: S102
+                compile(code, "<viz_code>", "exec"),
+                {"df": df.copy(), "plt": plt, "pd": pd, "matplotlib": matplotlib, "io": io},
+            )
+            logger.info("[agentic_chat] ✔ exec done | charts: %d", len(captured))
+        except Exception as exec_err:
+            logger.error("[agentic_chat] ✘ exec failed: %s\ncode:\n%s", exec_err, code)
+        finally:
+            plt.show = _orig_show
+            plt.close("all")
+
+        viz_b64 = captured[0] if captured else None
+        if viz_b64:
+            logger.info("[agentic_chat] ✔ visualize | chart %d chars b64", len(viz_b64))
         else:
-            logger.warning("[agentic_chat] ✘ visualize | no chart captured")
-            viz_b64 = None
+            logger.warning("[agentic_chat] ✘ visualize | no chart (plt.show not called?)")
+
         return {**state, "viz_b64": viz_b64}
 
     except Exception as e:
-        logger.error("[agentic_chat] ✘ visualize | error: %s", e)
+        logger.error("[agentic_chat] ✘ visualize | outer error: %s", e)
+        plt.close("all")
         return {**state, "viz_b64": None}
 
 
@@ -254,7 +238,7 @@ def visualize_node(state: AgenticChatState) -> AgenticChatState:
 
 def synthesize_node(state: AgenticChatState) -> AgenticChatState:
     logger.info(
-        "[agentic_chat] ▶ synthesize | web_results=%d  has_chart=%s",
+        "[agentic_chat] ▶ synthesize | web=%d chart=%s",
         len(state.get("web_results") or []),
         bool(state.get("viz_b64")),
     )
@@ -264,9 +248,8 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
     brand_a = meta.get("brand_a_name", "Brand A")
     brand_b = meta.get("brand_b_name", "Brand B")
 
-    import re as _re
     def _strip_images(text: str) -> str:
-        return _re.sub(r'!\[.*?\]\(data:image/[^)]+\)', '[chart]', text).strip()
+        return re.sub(r'!\[.*?\]\(data:image/[^)]+\)', '[chart]', text).strip()
 
     history_block = "\n".join(
         f"{'User' if m.get('role') == 'user' else 'Assistant'}: {_strip_images(m.get('content', ''))}"
@@ -279,16 +262,31 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
         for i, r in enumerate(state["web_results"], 1):
             web_block += f"[{i}] {r['title']}\nURL: {r['url']}\n{r['content']}\n\n"
 
+    has_chart = bool(state.get("viz_b64")) and len(state.get("viz_b64", "")) > 100
+
+    if has_chart:
+        chart_instruction = (
+            "A real matplotlib chart is already attached below your answer — the user will see it. "
+            "IMPORTANT: Do NOT include any chart, graph, ASCII art, text bars, dashes, "
+            "or any visual representation in your text. Write only a brief text insight."
+        )
+    else:
+        chart_instruction = (
+            "No chart image is available. "
+            "Do NOT create ASCII charts, text bars, dashes, or any text-based visual. "
+            "State numbers in plain bullet points only."
+        )
+
     full_prompt = (
         f"{state['context_block']}{web_block}\n\n"
         f"{history_block}\n\n"
         f"User: {state['message']}\n\n"
-        "Answer directly and practically. Use bullet points where helpful. "
-        "Reference specific numbers when relevant.\n\n"
+        f"{chart_instruction} "
+        f"Answer directly and practically. Use bullet points where helpful. "
+        f"Reference specific numbers when relevant.\n\n"
         f'After your answer add a "---" divider then a "**Sources:**" section:\n'
-        f"- Always include: \"📊 Internal scraped data · {brand_a} & {brand_b} · {period}\"\n"
-        "- For each web result that actually contributed to your answer add: "
-        '"🌐 [title](url)"\n\n'
+        f'- Always include: "📊 Internal scraped data · {brand_a} & {brand_b} · {period}"\n'
+        '- For each web result that contributed: "🌐 [title](url)"\n\n'
         "Assistant:"
     )
 
@@ -299,7 +297,7 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
     if len(b64) > 100:
         answer += f"\n\n![Visualization](data:image/png;base64,{b64})"
 
-    logger.info("[agentic_chat] ✔ synthesize | answer length: %d chars", len(answer))
+    logger.info("[agentic_chat] ✔ synthesize | %d chars", len(answer))
     return {**state, "final_answer": answer}
 
 
@@ -342,10 +340,10 @@ def _compile() -> StateGraph:
     return g.compile()
 
 
-_GRAPH = None
+_GRAPH: Optional[StateGraph] = None
 
 
-def _get_graph():
+def _get_graph() -> StateGraph:
     global _GRAPH
     if _GRAPH is None:
         _GRAPH = _compile()
@@ -368,8 +366,7 @@ def run_agentic_chat(
         context_meta.get("brand_b_name", "?"),
         len(history),
     )
-    graph = _get_graph()
-    result = graph.invoke({
+    result = _get_graph().invoke({
         "message": message,
         "history": history,
         "context_block": context_block,

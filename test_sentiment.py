@@ -3,10 +3,6 @@ import types
 
 from fastapi.testclient import TestClient
 
-sys.modules.setdefault("google", types.ModuleType("google"))
-genai_stub = types.ModuleType("google.generativeai")
-genai_stub.GenerativeModel = object
-sys.modules.setdefault("google.generativeai", genai_stub)
 seaborn_stub = types.ModuleType("seaborn")
 seaborn_stub.set_theme = lambda **kwargs: None
 sys.modules.setdefault("seaborn", seaborn_stub)
