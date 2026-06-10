@@ -8,7 +8,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-import google.generativeai as genai
+from openai import OpenAI
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,8 +32,28 @@ logger = logging.getLogger(__name__)
 
 from agentic_chat import run_agentic_chat  # noqa: E402
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
+
+def _deepseek_text_sync(prompt: str, max_tokens: int = 8192) -> str:
+    """Synchronous DeepSeek call — run via asyncio.to_thread to avoid blocking the event loop."""
+    client = OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com",
+        timeout=120.0,
+    )
+    resp = client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+async def _deepseek_text(prompt: str, max_tokens: int = 8192) -> str:
+    return await asyncio.to_thread(_deepseek_text_sync, prompt, max_tokens)
 
 # ---------------------------------------------------------------------------
 # IndoBERT sentiment model — lazy-loaded on first request
@@ -224,14 +244,6 @@ def _fig_to_b64(fig: plt.Figure) -> str:
     return base64.b64encode(buf.read()).decode()
 
 
-def _fig_to_pil(fig: plt.Figure) -> Image.Image:
-    """Encode a matplotlib Figure as a PIL Image for multimodal LLM input."""
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    buf.seek(0)
-    return Image.open(buf).copy()
-
-
 def _render_sentiment_chart(
     sentiment_a: "SentimentCount",
     sentiment_b: "SentimentCount",
@@ -353,37 +365,6 @@ def _render_wordcloud_chart(words: list[str]) -> str | None:
 
 
 
-def _render_sentiment_chart_for_llm(
-    sentiment_a: "SentimentCount",
-    sentiment_b: "SentimentCount",
-    label_a: str,
-    label_b: str,
-) -> Image.Image:
-    """Simple grouped bar chart sent to the LLM for visual analysis."""
-    categories = ["Positive", "Neutral", "Negative"]
-    vals_a = [sentiment_a.positive, sentiment_a.neutral, sentiment_a.negative]
-    vals_b = [sentiment_b.positive, sentiment_b.neutral, sentiment_b.negative]
-    x = range(len(categories))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    bars_a = ax.bar([i - width / 2 for i in x], vals_a, width, label=label_a, color="#3b82f6")
-    bars_b = ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color="#f59e0b")
-    ax.set_ylabel("Post Count")
-    ax.set_title("Sentiment Distribution by Brand")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(categories)
-    ax.legend()
-    for bar in bars_a:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                str(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
-    for bar in bars_b:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                str(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
-    img = _fig_to_pil(fig)
-    plt.close(fig)
-    return img
-
-
 def _render_sentiment_chart_modern(
     sentiment_a: "SentimentCount",
     sentiment_b: "SentimentCount",
@@ -440,43 +421,6 @@ def _render_sentiment_chart_modern(
     b64 = _fig_to_b64(fig)
     plt.close(fig)
     return b64
-
-
-def _render_engagement_chart_for_llm(
-    acc_a: "AccountSnapshot",
-    acc_b: "AccountSnapshot",
-    label_a: str,
-    label_b: str,
-) -> Image.Image:
-    """Simple grouped bar chart sent to the LLM for visual analysis."""
-    metrics = ["Followers", "Total\nEngagement", "Avg Likes"]
-    vals_a = [acc_a.followers, acc_a.total_engagement, acc_a.avg_likes]
-    vals_b = [acc_b.followers, acc_b.total_engagement, acc_b.avg_likes]
-    x = range(len(metrics))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    bars_a = ax.bar([i - width / 2 for i in x], vals_a, width, label=label_a, color="#3b82f6")
-    bars_b = ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color="#f59e0b")
-    ax.set_ylabel("Count")
-    ax.set_title("Engagement Metrics Comparison")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(metrics)
-    ax.legend()
-
-    def _fmt(v: int) -> str:
-        if v >= 1_000_000: return f"{v / 1_000_000:.1f}M"
-        if v >= 1_000: return f"{v / 1_000:.1f}K"
-        return str(v)
-
-    for bar in bars_a:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                _fmt(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
-    for bar in bars_b:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                _fmt(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
-    img = _fig_to_pil(fig)
-    plt.close(fig)
-    return img
 
 
 def _render_engagement_chart_modern(
@@ -540,20 +484,17 @@ def health() -> dict[str, str]:
 
 @app.post("/api/v1/analysis")
 async def generate_analysis(request: AnalysisRequest) -> AnalysisResponse:
-    if not GEMINI_API_KEY:
+    if not DEEPSEEK_API_KEY:
         return AnalysisResponse(
-            executive_summary="Gemini API key not configured. Add GEMINI_API_KEY to .env to enable AI analysis.",
-            kalventis_insights="Configure GEMINI_API_KEY to enable Kalventis insights.",
-            gsk_insights="Configure GEMINI_API_KEY to enable GSK competitive insights.",
-            recommendations=["Add GEMINI_API_KEY to D:\\fastapi_all\\python-social-listening\\.env"],
+            executive_summary="DeepSeek API key not configured. Add DEEPSEEK_API_KEY to .env to enable AI analysis.",
+            kalventis_insights="Configure DEEPSEEK_API_KEY to enable Kalventis insights.",
+            gsk_insights="Configure DEEPSEEK_API_KEY to enable GSK competitive insights.",
+            recommendations=["Add DEEPSEEK_API_KEY to D:\\fastapi_all\\python-social-listening\\.env"],
             risk_indicators=[],
             opportunities=[],
         )
 
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-
         kv = request.kalventis
         gsk = request.gsk
         kv_total = kv.sentiment.positive + kv.sentiment.neutral + kv.sentiment.negative
@@ -603,10 +544,7 @@ Respond ONLY in valid JSON with exactly these keys (no markdown, no code blocks)
 
 Focus on vaccine awareness, public health education in Indonesia, and practical content strategy advice."""
 
-        response = model.generate_content(prompt)
-        raw = response.text.strip()
-
-
+        raw = await _deepseek_text(prompt)
         data = _extract_json(raw)
 
 
@@ -627,7 +565,7 @@ Focus on vaccine awareness, public health education in Indonesia, and practical 
         )
 
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error from Gemini: {e}")
+        logger.error(f"JSON parse error from DeepSeek: {e}")
         logger.error(f"Raw response (first 500 chars): {raw[:500]}")
         return AnalysisResponse(
             executive_summary="Analysis generated but could not be parsed. Please retry.",
@@ -684,9 +622,9 @@ class DeepAnalysisResponse(BaseModel):
 
 @app.post("/api/v1/monitoring/analysis")
 async def deep_monitoring_analysis(request: DeepAnalysisRequest) -> DeepAnalysisResponse:
-    if not GEMINI_API_KEY:
+    if not DEEPSEEK_API_KEY:
         return DeepAnalysisResponse(
-            executive_summary="Gemini API key not configured.",
+            executive_summary="DeepSeek API key not configured.",
             brand_a_insights="", brand_b_insights="",
             content_strategy="", competitive_analysis="",
             audience_insights="", sentiment_deep_dive="",
@@ -695,8 +633,6 @@ async def deep_monitoring_analysis(request: DeepAnalysisRequest) -> DeepAnalysis
 
     try:
         raw = ""
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
 
         a = request.brand_a
         b = request.brand_b
@@ -773,11 +709,10 @@ Analyze the following comprehensive social media monitoring data for two brands.
 === MONITORING PERIOD ===
 {request.period or 'Recent scan window'}
 
-=== CHART IMAGES FOR VISUAL ANALYSIS ===
-Two chart images are attached to this request:
-- Image 1: Sentiment Distribution Chart — grouped bar chart showing positive, neutral, and negative post counts for both brands side by side
-- Image 2: Engagement Metrics Chart — grouped bar chart showing followers, total engagement, and avg likes per post for both brands
-Study these charts carefully when writing the chart-specific insight fields below.
+=== CHART DATA FOR VISUAL ANALYSIS ===
+The following data will be rendered into charts on the frontend. Use the raw numbers above when writing the chart-specific insight fields below:
+- Sentiment Chart: positive/neutral/negative counts for both brands (see BRAND A and BRAND B sections above)
+- Engagement Chart: followers, total engagement, and avg likes per post for both brands (see BRAND A and BRAND B sections above)
 
 === INSTRUCTIONS ===
 Respond ONLY in valid JSON with exactly these keys. Every string field MUST contain substantive analysis (4-6 sentences minimum). Every list field MUST have 4-5 items. No markdown, no code fences.
@@ -800,19 +735,7 @@ Respond ONLY in valid JSON with exactly these keys. Every string field MUST cont
 
 Base every insight on the actual data provided. Reference specific numbers. If data is thin or coverage is partial, acknowledge the limitation and recommend a re-scan."""  # noqa: E501
 
-        # Chart 1: simple charts for LLM visual analysis (multimodal input)
-        sentiment_llm_img = _render_sentiment_chart_for_llm(
-            a.sentiment, b.sentiment, request.brand_a_name, request.brand_b_name
-        )
-        engagement_llm_img = _render_engagement_chart_for_llm(
-            a, b, request.brand_a_name, request.brand_b_name
-        )
-
-        response = model.generate_content(
-            [sentiment_llm_img, engagement_llm_img, prompt],
-            generation_config={"temperature": 0, "max_output_tokens": 65536},
-        )
-        raw = response.text.strip()
+        raw = await _deepseek_text(prompt, max_tokens=16384)
 
         data = _extract_json(raw)
 
@@ -896,16 +819,13 @@ class KalventisAnalysisResponse(BaseModel):
 
 @app.post("/api/v1/kalventis/overview-analysis")
 async def kalventis_overview_analysis(request: KalventisAnalysisRequest) -> KalventisAnalysisResponse:
-    if not GEMINI_API_KEY:
+    if not DEEPSEEK_API_KEY:
         return KalventisAnalysisResponse(
-            topics=[], content_summary="GEMINI_API_KEY not configured.",
+            topics=[], content_summary="DEEPSEEK_API_KEY not configured.",
             patterns=[], recommendations=[],
         )
 
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-
         posts_sample = request.posts[:15]
         posts_text = "\n".join(
             f"[{i+1}] {p.type}: {p.likes} likes, {p.comments} comments - {p.caption[:100]}"
@@ -926,8 +846,7 @@ Return ONLY valid JSON (no markdown):
   "recommendations": ["action 1", "action 2", "action 3", "action 4"]
 }}"""
 
-        result = model.generate_content(prompt)
-        raw = result.text.strip()
+        raw = await _deepseek_text(prompt)
         data = _extract_json(raw)
 
         topics = [TopicItem(name=t.get("name",""), mentions=t.get("mentions",0), momentum=t.get("momentum","steady"), summary=t.get("summary","")) for t in data.get("topics",[])]
@@ -996,15 +915,34 @@ class FullAnalysisResponse(BaseModel):
     created_at: str
 
 
-def _analyse_chart_vision(model: genai.GenerativeModel, b64: str, title: str) -> str:
+async def _analyse_chart_vision(b64: str, title: str) -> str:
+    """Extract text from a chart image via UnstructuredImageLoader, then analyze with DeepSeek."""
+    import tempfile
     try:
-        img = Image.open(io.BytesIO(base64.b64decode(b64)))
+        from langchain_community.document_loaders.image import UnstructuredImageLoader
+
+        img_bytes = base64.b64decode(b64)
+
+        def _load_image() -> str:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+            try:
+                loader = UnstructuredImageLoader(tmp_path)
+                docs = loader.load()
+                return "\n".join(d.page_content for d in docs)
+            finally:
+                os.unlink(tmp_path)
+
+        chart_text = await asyncio.to_thread(_load_image)
         prompt = (
             f"You are analyzing a '{title}' chart for Kalventis, an Indonesian vaccine brand's "
-            "social media analytics dashboard. In 2-3 concise sentences, describe the key insight "
-            "this chart reveals and what it means for the brand's content strategy."
+            "social media analytics dashboard. The following text and labels were extracted "
+            f"from the chart image:\n\n{chart_text}\n\n"
+            "In 2-3 concise sentences, describe the key insight this chart reveals "
+            "and what it means for the brand's content strategy."
         )
-        return model.generate_content([prompt, img]).text.strip()
+        return await _deepseek_text(prompt)
     except Exception as e:
         logger.error(f"Vision analysis failed for '{title}': {e}")
         return ""
@@ -1012,16 +950,13 @@ def _analyse_chart_vision(model: genai.GenerativeModel, b64: str, title: str) ->
 
 @app.post("/api/v1/full-analysis")
 async def full_analysis(request: FullAnalysisRequest) -> FullAnalysisResponse:
-    if not GEMINI_API_KEY:
+    if not DEEPSEEK_API_KEY:
         return FullAnalysisResponse(
-            analysis_text="Gemini API key not configured.",
+            analysis_text="DeepSeek API key not configured.",
             key_findings=[], recommendations=[], risk_indicators=[], opportunities=[],
             topics=[], content_summary="", patterns=[], content_recommendations=[],
             charts=[], created_at=datetime.now(timezone.utc).isoformat(),
         )
-
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
 
     kv = request.kalventis
     gsk = request.gsk
@@ -1040,18 +975,18 @@ async def full_analysis(request: FullAnalysisRequest) -> FullAnalysisResponse:
     charts.append(ChartItem(
         title="Sentiment Distribution",
         image_base64=sentiment_b64,
-        analysis=_analyse_chart_vision(model, sentiment_b64, "Sentiment Distribution"),
+        analysis=await _analyse_chart_vision(sentiment_b64, "Sentiment Distribution"),
     ))
     charts.append(ChartItem(
         title="Engagement Metrics",
         image_base64=engagement_b64,
-        analysis=_analyse_chart_vision(model, engagement_b64, "Engagement Metrics"),
+        analysis=await _analyse_chart_vision(engagement_b64, "Engagement Metrics"),
     ))
     if wordcloud_b64:
         charts.append(ChartItem(
             title="Word Cloud",
             image_base64=wordcloud_b64,
-            analysis=_analyse_chart_vision(model, wordcloud_b64, "Word Cloud"),
+            analysis=await _analyse_chart_vision(wordcloud_b64, "Word Cloud"),
         ))
 
     # --- Competitive analysis ---
@@ -1098,14 +1033,14 @@ Top terms: {', '.join(request.top_words[:10]) or 'N/A'} | Period: {request.perio
     topic_data: dict = {}
 
     try:
-        comp_data = _extract_json(model.generate_content(competitive_prompt).text.strip())
+        comp_data = _extract_json(await _deepseek_text(competitive_prompt))
     except Exception as e:
         logger.error(f"Competitive analysis error: {e}")
         comp_data = {"analysis_text": f"Analysis unavailable: {e}", "key_findings": [],
                      "recommendations": [], "risk_indicators": [], "opportunities": []}
 
     try:
-        topic_data = _extract_json(model.generate_content(topic_prompt).text.strip())
+        topic_data = _extract_json(await _deepseek_text(topic_prompt))
     except Exception as e:
         logger.error(f"Topic analysis error: {e}")
         topic_data = {"topics": [], "content_summary": "", "patterns": [], "content_recommendations": []}
@@ -1181,8 +1116,8 @@ class SocialChatResponse(BaseModel):
 
 @app.post("/api/v1/chat")
 async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
-    if not GEMINI_API_KEY:
-        return SocialChatResponse(response="Gemini API key not configured.")
+    if not DEEPSEEK_API_KEY:
+        return SocialChatResponse(response="DeepSeek API key not configured.")
 
     ctx = request.context
     if ctx:
@@ -1252,7 +1187,8 @@ async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
     try:
-        response_text = run_agentic_chat(
+        response_text = await asyncio.to_thread(
+            run_agentic_chat,
             message=request.message,
             history=history,
             context_block=context_block,
@@ -1294,8 +1230,8 @@ class MonitoringChatRequest(BaseModel):
 
 @app.post("/api/v1/monitoring/chat")
 async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
-    if not GEMINI_API_KEY:
-        return SocialChatResponse(response="Gemini API key not configured.")
+    if not DEEPSEEK_API_KEY:
+        return SocialChatResponse(response="DeepSeek API key not configured.")
 
     ctx = request.context
     if ctx:
@@ -1390,7 +1326,8 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
     try:
-        response_text = run_agentic_chat(
+        response_text = await asyncio.to_thread(
+            run_agentic_chat,
             message=request.message,
             history=history,
             context_block=context_block,
