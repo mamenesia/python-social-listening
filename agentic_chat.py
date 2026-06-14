@@ -80,7 +80,7 @@ def _build_df(context_data: dict) -> pd.DataFrame:
 def classify_intent_node(state: AgenticChatState) -> AgenticChatState:
     logger.info("[agentic_chat] ▶ classify_intent | message: %r", state["message"])
     llm = _llm()
-    prompt = f"""You are routing an analytics chatbot request. Classify the message below.
+    prompt = f"""You are routing a social media analytics chatbot request. Classify the message below.
 
 Message: "{state['message']}"
 
@@ -89,10 +89,22 @@ NEEDS_WEB_SEARCH: yes or no
 NEEDS_VISUALIZATION: yes or no
 WEB_QUERY: short search query or none
 
-Rules:
-- NEEDS_WEB_SEARCH = yes → question requires current news, external trends, recent events, or facts outside the internal social media metrics dashboard
-- NEEDS_VISUALIZATION = yes → user explicitly requests a chart, graph, plot, or visual
-- WEB_QUERY → 5–8 word search query if web search needed, otherwise "none"
+Rules for NEEDS_WEB_SEARCH = yes (any one of these applies):
+- Asks about digital campaign strategy, best practices, or recommendations
+- Asks about viral content, trending topics, or popular threads on social media
+- Asks about competitor intelligence beyond the two internal accounts
+- Asks about platform algorithms (Instagram, TikTok, Twitter/X, Facebook, LinkedIn)
+- Asks about industry benchmarks, engagement rates, or market comparisons
+- Asks about tools, tactics, or approaches used by successful brands
+- Asks for news, recent events, or facts outside the internal scraped metrics
+
+Rules for NEEDS_VISUALIZATION = yes:
+- User explicitly requests a chart, graph, plot, bar chart, pie chart, or visual
+
+WEB_QUERY rules:
+- If NEEDS_WEB_SEARCH = yes: write a 6–10 word search query optimized for social media marketing intelligence
+- Focus the query on finding actionable marketing insights, not generic info
+- If NEEDS_WEB_SEARCH = no: write "none"
 """
     result = llm.invoke(prompt)
     content = result.content.strip()
@@ -121,6 +133,28 @@ Rules:
 
 # ─── Node: web_search ────────────────────────────────────────────────────────
 
+_MARKETING_DOMAINS = [
+    "hootsuite.com",
+    "sproutsocial.com",
+    "buffer.com",
+    "socialmediaexaminer.com",
+    "hubspot.com",
+    "semrush.com",
+    "sprinklr.com",
+    "later.com",
+    "marketingland.com",
+    "contentmarketinginstitute.com",
+    "searchengineland.com",
+    "socialbakers.com",
+    "brandwatch.com",
+    "mention.com",
+    "blog.google",
+    "techcrunch.com",
+    "forbes.com",
+    "businessinsider.com",
+]
+
+
 def web_search_node(state: AgenticChatState) -> AgenticChatState:
     logger.info("[agentic_chat] ▶ web_search | query: %r", state["web_query"])
     api_key = os.getenv("TAVILY_API_KEY", "")
@@ -129,15 +163,30 @@ def web_search_node(state: AgenticChatState) -> AgenticChatState:
         return {**state, "web_results": []}
     try:
         os.environ["TAVILY_API_KEY"] = api_key
-        tavily = TavilySearchResults(k=4)
-        raw = tavily.invoke(state["web_query"])
+
+        # First pass: search within marketing intelligence domains
+        tavily_focused = TavilySearchResults(
+            max_results=5,
+            search_depth="advanced",
+            include_domains=_MARKETING_DOMAINS,
+        )
+        raw = tavily_focused.invoke(state["web_query"])
+
+        # If focused search returns < 3 results, supplement with an open search
+        if len(raw) < 3:
+            logger.info("[agentic_chat]   web_search | focused returned %d, running open search", len(raw))
+            tavily_open = TavilySearchResults(max_results=4, search_depth="advanced")
+            raw_open = tavily_open.invoke(state["web_query"])
+            seen = {r.get("url") for r in raw}
+            raw += [r for r in raw_open if r.get("url") not in seen]
+
         results = [
             {
                 "title": r.get("title") or r.get("url", "Source"),
                 "url": r.get("url", ""),
-                "content": r.get("content", "")[:600],
+                "content": r.get("content", "")[:800],
             }
-            for r in raw[:4]
+            for r in raw[:6]
         ]
         logger.info("[agentic_chat] ✔ web_search | %d results", len(results))
         return {**state, "web_results": results}
@@ -277,17 +326,36 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
             "State numbers in plain bullet points only."
         )
 
+    has_web = bool(state.get("web_results"))
+
+    system_persona = (
+        "You are a senior digital marketing strategist and social media analyst. "
+        "You specialize in Instagram and TikTok brand growth, viral content strategy, "
+        "paid and organic campaign design, influencer marketing, and competitive intelligence. "
+        "You draw on both the internal scraped metrics provided AND the latest industry research "
+        "from sources like HootSuite, Sprout Social, SEMrush, HubSpot, and Google. "
+        "Your answers are specific, actionable, and grounded in data — not generic advice."
+    )
+
+    answer_instructions = (
+        f"{chart_instruction} "
+        "Give a direct, practical answer. "
+        "Use bullet points for recommendations and insights. "
+        "When web research is available, synthesize it with the internal data — do not just summarize the sources. "
+        "Reference specific numbers, percentages, or benchmarks where relevant. "
+        "If recommending a campaign tactic, explain WHY it fits this brand's specific situation."
+    )
+
     full_prompt = (
+        f"{system_persona}\n\n"
         f"{state['context_block']}{web_block}\n\n"
         f"{history_block}\n\n"
         f"User: {state['message']}\n\n"
-        f"{chart_instruction} "
-        f"Answer directly and practically. Use bullet points where helpful. "
-        f"Reference specific numbers when relevant.\n\n"
+        f"{answer_instructions}\n\n"
         f'After your answer add a "---" divider then a "**Sources:**" section:\n'
         f'- Always include: "📊 Internal scraped data · {brand_a} & {brand_b} · {period}"\n'
-        '- For each web result that contributed: "🌐 [title](url)"\n\n'
-        "Assistant:"
+        + ('- For each web result that contributed: "🌐 [title](url)"\n' if has_web else "")
+        + "\nAssistant:"
     )
 
     response = llm.invoke(full_prompt)
