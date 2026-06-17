@@ -16,6 +16,8 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
+import news_intelligence as ni
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -31,8 +33,13 @@ class AgenticChatState(TypedDict):
     context_meta: dict
     needs_web_search: bool
     needs_visualization: bool
+    needs_news: bool
+    needs_viral: bool
+    topic: str
     web_query: str
     web_results: list
+    news_brief: dict
+    viral_angles: list
     viz_b64: Optional[str]
     final_answer: str
 
@@ -84,51 +91,81 @@ def classify_intent_node(state: AgenticChatState) -> AgenticChatState:
 
 Message: "{state['message']}"
 
-Reply with EXACTLY these 3 lines — no other text:
+Reply with EXACTLY these 5 lines — no other text:
+NEEDS_NEWS: yes or no
+NEEDS_VIRAL: yes or no
 NEEDS_WEB_SEARCH: yes or no
 NEEDS_VISUALIZATION: yes or no
+TOPIC: the subject to research/create content about, or none
 WEB_QUERY: short search query or none
 
-Rules for NEEDS_WEB_SEARCH = yes (any one of these applies):
-- Asks about digital campaign strategy, best practices, or recommendations
-- Asks about viral content, trending topics, or popular threads on social media
-- Asks about competitor intelligence beyond the two internal accounts
-- Asks about platform algorithms (Instagram, TikTok, Twitter/X, Facebook, LinkedIn)
-- Asks about industry benchmarks, engagement rates, or market comparisons
-- Asks about tools, tactics, or approaches used by successful brands
-- Asks for news, recent events, or facts outside the internal scraped metrics
+Rules for NEEDS_NEWS = yes (wants latest, credible, real-world information):
+- Asks about latest news, recent events, current developments, or facts about a topic
+- Asks "what is happening with…", "is it true that…", or for credible/verified info
+- Wants up-to-date context before deciding on content
+
+Rules for NEEDS_VIRAL = yes (wants content ideas to create):
+- Asks for content ideas, viral angles, hooks, captions, post ideas, or a campaign
+- Asks "what should we post about…", "how do we make this go viral", "give me angles"
+
+Rules for NEEDS_WEB_SEARCH = yes (marketing-strategy research, NOT news):
+- Asks about digital campaign best practices, platform algorithms, benchmarks, or tactics used by brands
 
 Rules for NEEDS_VISUALIZATION = yes:
 - User explicitly requests a chart, graph, plot, bar chart, pie chart, or visual
 
+TOPIC rules:
+- If NEEDS_NEWS or NEEDS_VIRAL = yes: extract the core subject (e.g. "vaksin HPV di Indonesia"). Else "none".
+
 WEB_QUERY rules:
-- If NEEDS_WEB_SEARCH = yes: write a 6–10 word search query optimized for social media marketing intelligence
-- Focus the query on finding actionable marketing insights, not generic info
-- If NEEDS_WEB_SEARCH = no: write "none"
+- If NEEDS_WEB_SEARCH = yes: a 6–10 word query for marketing intelligence. Else "none".
 """
     result = llm.invoke(prompt)
     content = result.content.strip()
 
+    needs_news = False
+    needs_viral = False
     needs_web = False
     needs_viz = False
+    topic = ""
     web_query = state["message"]
 
     for line in content.splitlines():
         key, _, val = line.partition(":")
         key = key.strip().upper()
         val = val.strip()
-        if key == "NEEDS_WEB_SEARCH":
+        if key == "NEEDS_NEWS":
+            needs_news = "yes" in val.lower()
+        elif key == "NEEDS_VIRAL":
+            needs_viral = "yes" in val.lower()
+        elif key == "NEEDS_WEB_SEARCH":
             needs_web = "yes" in val.lower()
         elif key == "NEEDS_VISUALIZATION":
             needs_viz = "yes" in val.lower()
+        elif key == "TOPIC" and val.lower() != "none" and val:
+            topic = val
         elif key == "WEB_QUERY" and val.lower() != "none" and val:
             web_query = val
 
+    # Viral content must be grounded in credible news → force a news pass.
+    if needs_viral:
+        needs_news = True
+    if (needs_news or needs_viral) and not topic:
+        topic = state["message"]
+
     logger.info(
-        "[agentic_chat] ✔ classify_intent | web=%s viz=%s query=%r",
-        needs_web, needs_viz, web_query,
+        "[agentic_chat] ✔ classify_intent | news=%s viral=%s web=%s viz=%s topic=%r",
+        needs_news, needs_viral, needs_web, needs_viz, topic,
     )
-    return {**state, "needs_web_search": needs_web, "needs_visualization": needs_viz, "web_query": web_query}
+    return {
+        **state,
+        "needs_news": needs_news,
+        "needs_viral": needs_viral,
+        "needs_web_search": needs_web,
+        "needs_visualization": needs_viz,
+        "topic": topic,
+        "web_query": web_query,
+    }
 
 
 # ─── Node: web_search ────────────────────────────────────────────────────────
@@ -193,6 +230,57 @@ def web_search_node(state: AgenticChatState) -> AgenticChatState:
     except Exception as e:
         logger.error("[agentic_chat] ✘ web_search | %s", e)
         return {**state, "web_results": []}
+
+
+# ─── Node: news — deep credible-news intake ──────────────────────────────────
+
+def news_node(state: AgenticChatState) -> AgenticChatState:
+    topic = state.get("topic") or state["message"]
+    logger.info("[agentic_chat] ▶ news | topic: %r", topic)
+    try:
+        brief = ni.gather_news(topic, days=7, max_articles=10)
+        logger.info(
+            "[agentic_chat] ✔ news | %d articles, %d verified facts",
+            len(brief.get("articles", [])), len(brief.get("verified_facts", [])),
+        )
+        return {**state, "news_brief": brief}
+    except Exception as e:  # noqa: BLE001
+        logger.error("[agentic_chat] ✘ news | %s", e)
+        return {**state, "news_brief": {}}
+
+
+# ─── Node: viral — angle engine + safety guardrail ───────────────────────────
+
+def _internal_context_line(state: AgenticChatState) -> str:
+    """One-line summary of internal scraped data for grounding viral angles."""
+    cd = state.get("context_data") or {}
+    if not cd.get("brand_a"):
+        return ""
+    try:
+        df = _build_df(cd)
+        return "INTERNAL SCRAPED METRICS:\n" + df.to_string(index=False)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def viral_node(state: AgenticChatState) -> AgenticChatState:
+    topic = state.get("topic") or state["message"]
+    logger.info("[agentic_chat] ▶ viral | topic: %r", topic)
+    try:
+        meta = state.get("context_meta", {})
+        brand = meta.get("brand_a_name") or "Kalventis (@kenapaharusvaksin)"
+        angles = ni.viral_pipeline(
+            topic,
+            news_brief=state.get("news_brief"),
+            internal_context=_internal_context_line(state),
+            brand=brand,
+            n=4,
+        )
+        logger.info("[agentic_chat] ✔ viral | %d angles", len(angles))
+        return {**state, "viral_angles": angles}
+    except Exception as e:  # noqa: BLE001
+        logger.error("[agentic_chat] ✘ viral | %s", e)
+        return {**state, "viral_angles": []}
 
 
 # ─── Node: visualize — code-gen + exec ───────────────────────────────────────
@@ -311,6 +399,23 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
         for i, r in enumerate(state["web_results"], 1):
             web_block += f"[{i}] {r['title']}\nURL: {r['url']}\n{r['content']}\n\n"
 
+    news_block = ni.brief_to_prompt_block(state.get("news_brief") or {})
+
+    viral_block = ""
+    angles = state.get("viral_angles") or []
+    if angles:
+        viral_block = "\n\n=== VIRAL CONTENT ANGLES (already safety-reviewed) ===\n"
+        for i, a in enumerate(angles, 1):
+            safety = a.get("safety", {})
+            viral_block += (
+                f"[{i}] ({a.get('virality_score','?')}/100) {a.get('angle','')}\n"
+                f"    Platform: {a.get('platform','')} | Format: {a.get('format','')}\n"
+                f"    Hook: {a.get('hook','')}\n"
+                f"    Safety: {safety.get('verdict','?')}"
+                + (f" — {safety.get('fix','')}" if safety.get('fix') else "")
+                + "\n"
+            )
+
     has_chart = bool(state.get("viz_b64")) and len(state.get("viz_b64", "")) > 100
 
     if has_chart:
@@ -327,6 +432,8 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
         )
 
     has_web = bool(state.get("web_results"))
+    has_news = bool(state.get("news_brief", {}).get("articles"))
+    has_viral = bool(angles)
 
     system_persona = (
         "You are a senior digital marketing strategist and social media analyst. "
@@ -337,24 +444,38 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
         "Your answers are specific, actionable, and grounded in data — not generic advice."
     )
 
+    news_instruction = (
+        "A CREDIBLE NEWS BRIEF is provided. Ground every factual statement in it. "
+        "Only state VERIFIED FACTS as fact; clearly hedge anything from UNVERIFIED claims "
+        "(e.g. 'reportedly', 'not yet confirmed'). Never invent facts beyond the brief. "
+        if has_news else ""
+    )
+    viral_instruction = (
+        "VIRAL CONTENT ANGLES (already safety-reviewed) are provided. Present them as the core of your answer: "
+        "lead with the highest virality_score, include the hook verbatim, and respect each Safety verdict — "
+        "for 'caution' apply the fix, and do NOT recommend any 'block' angle (explain briefly why instead). "
+        if has_viral else ""
+    )
+
     answer_instructions = (
-        f"{chart_instruction} "
+        f"{chart_instruction} {news_instruction}{viral_instruction}"
         "Give a direct, practical answer. "
         "Use bullet points for recommendations and insights. "
-        "When web research is available, synthesize it with the internal data — do not just summarize the sources. "
+        "When research is available, synthesize it with the internal data — do not just summarize the sources. "
         "Reference specific numbers, percentages, or benchmarks where relevant. "
         "If recommending a campaign tactic, explain WHY it fits this brand's specific situation."
     )
 
     full_prompt = (
         f"{system_persona}\n\n"
-        f"{state['context_block']}{web_block}\n\n"
+        f"{state['context_block']}{web_block}{news_block}{viral_block}\n\n"
         f"{history_block}\n\n"
         f"User: {state['message']}\n\n"
         f"{answer_instructions}\n\n"
         f'After your answer add a "---" divider then a "**Sources:**" section:\n'
         f'- Always include: "📊 Internal scraped data · {brand_a} & {brand_b} · {period}"\n'
         + ('- For each web result that contributed: "🌐 [title](url)"\n' if has_web else "")
+        + ('- For each news article that contributed, cite it as "🌐 [title](url)"\n' if has_news else "")
         + "\nAssistant:"
     )
 
@@ -371,16 +492,33 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
 
 # ─── Routing ─────────────────────────────────────────────────────────────────
 
-def _route_after_classify(state: AgenticChatState) -> str:
-    if state["needs_web_search"]:
+def _next_after(state: AgenticChatState, *, skip: set[str]) -> str:
+    """Pick the next stage, skipping stages already visited."""
+    if state.get("needs_news") and "news" not in skip:
+        return "news"
+    if state.get("needs_viral") and "viral" not in skip:
+        return "viral"
+    if state.get("needs_web_search") and "web_search" not in skip:
         return "web_search"
-    if state["needs_visualization"]:
+    if state.get("needs_visualization") and "visualize" not in skip:
         return "visualize"
     return "synthesize"
 
 
+def _route_after_classify(state: AgenticChatState) -> str:
+    return _next_after(state, skip=set())
+
+
+def _route_after_news(state: AgenticChatState) -> str:
+    return _next_after(state, skip={"news"})
+
+
+def _route_after_viral(state: AgenticChatState) -> str:
+    return _next_after(state, skip={"news", "viral"})
+
+
 def _route_after_web(state: AgenticChatState) -> str:
-    return "visualize" if state["needs_visualization"] else "synthesize"
+    return _next_after(state, skip={"news", "viral", "web_search"})
 
 
 # ─── Graph ───────────────────────────────────────────────────────────────────
@@ -388,21 +526,22 @@ def _route_after_web(state: AgenticChatState) -> str:
 def _compile() -> StateGraph:
     g = StateGraph(AgenticChatState)
     g.add_node("classify_intent", classify_intent_node)
+    g.add_node("news", news_node)
+    g.add_node("viral", viral_node)
     g.add_node("web_search", web_search_node)
     g.add_node("visualize", visualize_node)
     g.add_node("synthesize", synthesize_node)
 
+    _stage_map = {
+        "news": "news", "viral": "viral", "web_search": "web_search",
+        "visualize": "visualize", "synthesize": "synthesize",
+    }
+
     g.set_entry_point("classify_intent")
-    g.add_conditional_edges(
-        "classify_intent",
-        _route_after_classify,
-        {"web_search": "web_search", "visualize": "visualize", "synthesize": "synthesize"},
-    )
-    g.add_conditional_edges(
-        "web_search",
-        _route_after_web,
-        {"visualize": "visualize", "synthesize": "synthesize"},
-    )
+    g.add_conditional_edges("classify_intent", _route_after_classify, _stage_map)
+    g.add_conditional_edges("news", _route_after_news, _stage_map)
+    g.add_conditional_edges("viral", _route_after_viral, _stage_map)
+    g.add_conditional_edges("web_search", _route_after_web, _stage_map)
     g.add_edge("visualize", "synthesize")
     g.add_edge("synthesize", END)
     return g.compile()
@@ -442,8 +581,13 @@ def run_agentic_chat(
         "context_meta": context_meta,
         "needs_web_search": False,
         "needs_visualization": False,
+        "needs_news": False,
+        "needs_viral": False,
+        "topic": "",
         "web_query": message,
         "web_results": [],
+        "news_brief": {},
+        "viral_angles": [],
         "viz_b64": None,
         "final_answer": "",
     })
