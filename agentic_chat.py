@@ -103,6 +103,9 @@ Rules for NEEDS_NEWS = yes (wants latest, credible, real-world information):
 - Asks about latest news, recent events, current developments, or facts about a topic
 - Asks "what is happening with…", "is it true that…", or for credible/verified info
 - Wants up-to-date context before deciding on content
+- TOPIC DISCOVERY: asks what topics/trends are popular, emerging, or being talked about now
+  (e.g. "what topics are trending", "what are people talking about", "what should we cover",
+  "what are we missing", "what else is popular besides what we track")
 
 Rules for NEEDS_VIRAL = yes (wants content ideas to create):
 - Asks for content ideas, viral angles, hooks, captions, post ideas, or a campaign
@@ -110,6 +113,8 @@ Rules for NEEDS_VIRAL = yes (wants content ideas to create):
 
 Rules for NEEDS_WEB_SEARCH = yes (marketing-strategy research, NOT news):
 - Asks about digital campaign best practices, platform algorithms, benchmarks, or tactics used by brands
+- TOPIC DISCOVERY: asks what topics/themes/angles competitors or the wider market are covering
+  that the team may not be tracking yet
 
 Rules for NEEDS_VISUALIZATION = yes:
 - User explicitly requests a chart, graph, plot, bar chart, pie chart, or visual
@@ -439,9 +444,14 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
         "You are a senior digital marketing strategist and social media analyst. "
         "You specialize in Instagram and TikTok brand growth, viral content strategy, "
         "paid and organic campaign design, influencer marketing, and competitive intelligence. "
-        "You draw on both the internal scraped metrics provided AND the latest industry research "
-        "from sources like HootSuite, Sprout Social, SEMrush, HubSpot, and Google. "
-        "Your answers are specific, actionable, and grounded in data — not generic advice."
+        "IMPORTANT: This chat is a TOPIC-DISCOVERY tool for a digital marketing team. They already "
+        "know the topics and themes in their internal scraped data, so do NOT just restate those. "
+        "Your primary job is to surface popular and emerging topics from the wider public conversation "
+        "that go BEYOND what they already track — trending subjects, adjacent angles, audience questions, "
+        "and competitor topics they may be missing. Lead with these new external topics and industry "
+        "research (HootSuite, Sprout Social, SEMrush, HubSpot, Google, news), then use the internal "
+        "scraped metrics only as the baseline of 'what they already cover' to contrast against and to "
+        "pinpoint the gaps and opportunities."
     )
 
     news_instruction = (
@@ -459,11 +469,14 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
 
     answer_instructions = (
         f"{chart_instruction} {news_instruction}{viral_instruction}"
-        "Give a direct, practical answer. "
-        "Use bullet points for recommendations and insights. "
-        "When research is available, synthesize it with the internal data — do not just summarize the sources. "
-        "Reference specific numbers, percentages, or benchmarks where relevant. "
-        "If recommending a campaign tactic, explain WHY it fits this brand's specific situation."
+        "Structure your answer in this order: "
+        "(1) Lead with NEW external topics worth their attention — trending subjects, emerging angles, "
+        "audience questions, and competitor themes that go BEYOND the topics already in their internal data. "
+        "For each, note why it is gaining traction now. "
+        "(2) Then map these back to the internal data — call out explicitly which are gaps (popular outside, "
+        "absent from their current themes) versus topics they already cover. "
+        "Use bullet points. Reference specific external benchmarks or numbers, then contrast with the internal numbers. "
+        "If recommending a topic or campaign tactic, explain WHY it is a fresh opportunity this team is not already pursuing."
     )
 
     full_prompt = (
