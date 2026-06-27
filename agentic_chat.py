@@ -31,6 +31,7 @@ class AgenticChatState(TypedDict):
     context_block: str
     context_data: dict
     context_meta: dict
+    intent: str  # "topic_discovery" | "specific"
     needs_web_search: bool
     needs_visualization: bool
     needs_news: bool
@@ -91,7 +92,8 @@ def classify_intent_node(state: AgenticChatState) -> AgenticChatState:
 
 Message: "{state['message']}"
 
-Reply with EXACTLY these 5 lines — no other text:
+Reply with EXACTLY these 7 lines — no other text:
+QUESTION_TYPE: specific or topic_discovery
 NEEDS_NEWS: yes or no
 NEEDS_VIRAL: yes or no
 NEEDS_WEB_SEARCH: yes or no
@@ -99,22 +101,24 @@ NEEDS_VISUALIZATION: yes or no
 TOPIC: the subject to research/create content about, or none
 WEB_QUERY: short search query or none
 
+QUESTION_TYPE rules (decide this FIRST):
+- "topic_discovery" ONLY if the user is explicitly asking what topics/themes/content ideas to cover,
+  what's trending, what they're missing, or for content/angle suggestions.
+- "specific" for ANY other question — best time/day to post, posting frequency, which format/platform,
+  a metric, a comparison, a how-to, or a tactical recommendation. When unsure, choose "specific".
+
 Rules for NEEDS_NEWS = yes (wants latest, credible, real-world information):
 - Asks about latest news, recent events, current developments, or facts about a topic
 - Asks "what is happening with…", "is it true that…", or for credible/verified info
-- Wants up-to-date context before deciding on content
 - TOPIC DISCOVERY: asks what topics/trends are popular, emerging, or being talked about now
-  (e.g. "what topics are trending", "what are people talking about", "what should we cover",
-  "what are we missing", "what else is popular besides what we track")
 
 Rules for NEEDS_VIRAL = yes (wants content ideas to create):
 - Asks for content ideas, viral angles, hooks, captions, post ideas, or a campaign
 - Asks "what should we post about…", "how do we make this go viral", "give me angles"
 
 Rules for NEEDS_WEB_SEARCH = yes (marketing-strategy research, NOT news):
-- Asks about digital campaign best practices, platform algorithms, benchmarks, or tactics used by brands
-- TOPIC DISCOVERY: asks what topics/themes/angles competitors or the wider market are covering
-  that the team may not be tracking yet
+- Asks about digital campaign best practices, platform algorithms, benchmarks, best posting times, or tactics
+- TOPIC DISCOVERY: asks what topics/themes/angles the wider market is covering that the team may be missing
 
 Rules for NEEDS_VISUALIZATION = yes:
 - User explicitly requests a chart, graph, plot, bar chart, pie chart, or visual
@@ -123,7 +127,9 @@ TOPIC rules:
 - If NEEDS_NEWS or NEEDS_VIRAL = yes: extract the core subject (e.g. "vaksin HPV di Indonesia"). Else "none".
 
 WEB_QUERY rules:
-- If NEEDS_WEB_SEARCH = yes: a 6–10 word query for marketing intelligence. Else "none".
+- If NEEDS_WEB_SEARCH = yes: build a query that FAITHFULLY reflects the user's actual question — do NOT turn a
+  specific question into a content-topic query. E.g. for best time to post →
+  "best time to post Instagram TikTok Indonesia audience"; for a tactic → that tactic. Else "none".
 """
     result = llm.invoke(prompt)
     content = result.content.strip()
@@ -134,12 +140,15 @@ WEB_QUERY rules:
     needs_viz = False
     topic = ""
     web_query = state["message"]
+    intent = "specific"  # default: answer the question directly, not topic-discovery
 
     for line in content.splitlines():
         key, _, val = line.partition(":")
         key = key.strip().upper()
         val = val.strip()
-        if key == "NEEDS_NEWS":
+        if key == "QUESTION_TYPE":
+            intent = "topic_discovery" if "topic" in val.lower() else "specific"
+        elif key == "NEEDS_NEWS":
             needs_news = "yes" in val.lower()
         elif key == "NEEDS_VIRAL":
             needs_viral = "yes" in val.lower()
@@ -159,11 +168,12 @@ WEB_QUERY rules:
         topic = state["message"]
 
     logger.info(
-        "[agentic_chat] ✔ classify_intent | news=%s viral=%s web=%s viz=%s topic=%r",
-        needs_news, needs_viral, needs_web, needs_viz, topic,
+        "[agentic_chat] ✔ classify_intent | intent=%s news=%s viral=%s web=%s viz=%s topic=%r",
+        intent, needs_news, needs_viral, needs_web, needs_viz, topic,
     )
     return {
         **state,
+        "intent": intent,
         "needs_news": needs_news,
         "needs_viral": needs_viral,
         "needs_web_search": needs_web,
@@ -176,6 +186,22 @@ WEB_QUERY rules:
 # ─── Node: web_search ────────────────────────────────────────────────────────
 
 _MARKETING_DOMAINS = [
+    # Indonesian marketing / business / consumer-insight media (prioritised for
+    # local relevance — the audience and market is Indonesia).
+    "marketeers.com",
+    "mix.co.id",
+    "swa.co.id",
+    "marketing.co.id",
+    "dailysocial.id",
+    "katadata.co.id",
+    "goodstats.id",
+    "populix.co",
+    "techinasia.com",
+    "kontan.co.id",
+    "cnbcindonesia.com",
+    "gnfi.id",
+    # Global marketing-intelligence sources (use for frameworks/benchmarks only,
+    # then localise the takeaway to Indonesia).
     "hootsuite.com",
     "sproutsocial.com",
     "buffer.com",
@@ -184,16 +210,10 @@ _MARKETING_DOMAINS = [
     "semrush.com",
     "sprinklr.com",
     "later.com",
-    "marketingland.com",
     "contentmarketinginstitute.com",
-    "searchengineland.com",
-    "socialbakers.com",
     "brandwatch.com",
-    "mention.com",
     "blog.google",
     "techcrunch.com",
-    "forbes.com",
-    "businessinsider.com",
 ]
 
 
@@ -206,21 +226,45 @@ def web_search_node(state: AgenticChatState) -> AgenticChatState:
     try:
         os.environ["TAVILY_API_KEY"] = api_key
 
-        # First pass: search within marketing intelligence domains
-        tavily_focused = TavilySearchResults(
-            max_results=5,
-            search_depth="advanced",
-            include_domains=_MARKETING_DOMAINS,
-        )
-        raw = tavily_focused.invoke(state["web_query"])
+        # Geo-bias the query to Indonesia so results reflect the local market
+        # and avoid surfacing Western-only cases/examples.
+        query = state["web_query"]
+        if "indonesia" not in query.lower():
+            query = f"{query} Indonesia"
 
-        # If focused search returns < 3 results, supplement with an open search
-        if len(raw) < 3:
-            logger.info("[agentic_chat]   web_search | focused returned %d, running open search", len(raw))
-            tavily_open = TavilySearchResults(max_results=4, search_depth="advanced")
-            raw_open = tavily_open.invoke(state["web_query"])
-            seen = {r.get("url") for r in raw}
-            raw += [r for r in raw_open if r.get("url") not in seen]
+        # Detect "what's viral/trending" intent — these want a broad, open search
+        # (viral content lives on news/listicle/social, not marketing blogs).
+        signal_text = f"{state.get('message', '')} {state['web_query']}".lower()
+        viral_intent = any(
+            k in signal_text
+            for k in ("viral", "trending", "trend", "ramai", "rame", "fyp",
+                      "ngetren", "ngetrend", "hits", "lagi naik", "sedang dibicarakan")
+        )
+        if viral_intent and not any(k in query.lower() for k in ("viral", "trending")):
+            query = f"{query} viral trending"
+
+        if viral_intent:
+            # Broad open search — better recall for viral-content discussions than
+            # the marketing-blog allowlist.
+            logger.info("[agentic_chat]   web_search | viral-discovery mode | query=%r", query)
+            tavily_open = TavilySearchResults(max_results=6, search_depth="advanced")
+            raw = tavily_open.invoke(query)
+        else:
+            # First pass: search within marketing intelligence domains
+            tavily_focused = TavilySearchResults(
+                max_results=5,
+                search_depth="advanced",
+                include_domains=_MARKETING_DOMAINS,
+            )
+            raw = tavily_focused.invoke(query)
+
+            # If focused search returns < 3 results, supplement with an open search
+            if len(raw) < 3:
+                logger.info("[agentic_chat]   web_search | focused returned %d, running open search", len(raw))
+                tavily_open = TavilySearchResults(max_results=4, search_depth="advanced")
+                raw_open = tavily_open.invoke(query)
+                seen = {r.get("url") for r in raw}
+                raw += [r for r in raw_open if r.get("url") not in seen]
 
         results = [
             {
@@ -441,17 +485,29 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
     has_viral = bool(angles)
 
     system_persona = (
-        "You are a senior digital marketing strategist and social media analyst. "
+        f"You are a senior digital marketing strategist advising {brand_a}, an Indonesian brand. "
         "You specialize in Instagram and TikTok brand growth, viral content strategy, "
-        "paid and organic campaign design, influencer marketing, and competitive intelligence. "
-        "IMPORTANT: This chat is a TOPIC-DISCOVERY tool for a digital marketing team. They already "
-        "know the topics and themes in their internal scraped data, so do NOT just restate those. "
-        "Your primary job is to surface popular and emerging topics from the wider public conversation "
-        "that go BEYOND what they already track — trending subjects, adjacent angles, audience questions, "
-        "and competitor topics they may be missing. Lead with these new external topics and industry "
-        "research (HootSuite, Sprout Social, SEMrush, HubSpot, Google, news), then use the internal "
-        "scraped metrics only as the baseline of 'what they already cover' to contrast against and to "
-        "pinpoint the gaps and opportunities."
+        "paid and organic campaign design, influencer marketing, and competitive intelligence.\n"
+        f"WHO IS WHO (do not confuse this): {brand_a} is YOUR CLIENT — every insight and recommendation "
+        f"must help {brand_a} grow and win. {brand_b} is a COMPETITOR — analyse and benchmark them ONLY to "
+        f"reveal {brand_a}'s gaps and opportunities. NEVER write advice addressed to {brand_b} or any "
+        f"suggestion that would help the competitor improve. If sources or data are about {brand_b}, treat "
+        f"them as competitor intelligence for {brand_a} to act on.\n"
+        "MARKET & AUDIENCE: the market is INDONESIA and the audience is Indonesian. Use Indonesian cultural "
+        "context, local consumer behaviour, and examples that genuinely fit Indonesian families and daily "
+        "life. Do NOT use Western-only scenarios (e.g. kids' ballet or basketball practice, Western parenting "
+        "norms) that don't resonate in Indonesia — localise every benchmark, trend, and idea to Indonesia.\n"
+        "ANSWER THE QUESTION ACTUALLY ASKED. Read the user's message and respond to THAT specifically — "
+        "do not force a fixed template onto every question. Keep the answer proportional to the question.\n"
+        "- For a SPECIFIC question (best time/day to post, a metric, how-to, comparison, a tactic): answer it "
+        "directly and concisely FIRST, with concrete numbers, focused on the platforms the brand actually uses "
+        f"(Instagram, TikTok, YouTube — never pad with irrelevant platforms like X/Twitter). Give {brand_a} a "
+        "clear, complete recommendation.\n"
+        "- Only when the user is asking about CONTENT TOPICS / THEMES / ideas should you act as a topic-discovery "
+        "tool: they already know the topics in their internal data, so do NOT just restate those — instead surface "
+        "popular and emerging topics from the wider INDONESIAN public conversation that go BEYOND what they track "
+        "(trending subjects, adjacent angles, audience questions, competitor topics they may be missing), then use "
+        f"the internal metrics as the baseline of 'what they already cover' to pinpoint {brand_a}'s gaps."
     )
 
     news_instruction = (
@@ -467,16 +523,50 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
         if has_viral else ""
     )
 
+    is_topic_discovery = state.get("intent") == "topic_discovery"
+    if is_topic_discovery:
+        structure_instruction = (
+            "The user is asking about CONTENT TOPICS/THEMES (e.g. what's viral/trending). Structure your answer: "
+            "(1) lead with NEW external topics/viral content worth their attention — trending subjects, emerging "
+            "angles, audience questions, and competitor themes that go BEYOND the topics already in their internal "
+            "data. Present these as a bulleted list where EACH item includes a markdown link to the source "
+            "[judul singkat](url) taken from the web/news results, plus one line on WHY it is going viral / "
+            "sedang ramai right now; "
+            "(2) then map these back to the internal data, calling out which are gaps versus already covered. "
+            "If recommending a topic or tactic, explain WHY it is a fresh opportunity. "
+            "Only cite links that actually appear in the provided web/news results — never invent URLs."
+        )
+    else:
+        structure_instruction = (
+            "The user asked a SPECIFIC question — answer THAT directly and completely. "
+            "Do NOT add a topic-discovery section, and do NOT introduce new content topics/themes the user "
+            "did not ask about, even if the web/news results below contain them — ignore any off-topic "
+            "material. Lead with the concrete answer and numbers, focused only on the platforms the brand "
+            "actually uses (Instagram, TikTok, YouTube — never X/Twitter). "
+            "For best time/day to post: if an 'ANALISIS WAKTU POSTING' block (computed from the brand's own "
+            "scraped posts) is present in the context, BASE your day/hour recommendation primarily on THAT "
+            "real data — cite the actual best days/hours and the viral posts' upload times from it — and use "
+            "external benchmarks only as secondary support. If that block is absent, fall back to benchmarks. "
+            "NEVER guess or fabricate the upload day/time of individual posts (do NOT write things like a post "
+            "was 'probably posted at 10-12'), and never claim internal posts 'confirm' a time unless their real "
+            "timestamps are actually provided. "
+            "Give specific days and hours in WIB per relevant platform, and end with a short concrete posting "
+            "schedule recommendation."
+        )
+
     answer_instructions = (
         f"{chart_instruction} {news_instruction}{viral_instruction}"
-        "Structure your answer in this order: "
-        "(1) Lead with NEW external topics worth their attention — trending subjects, emerging angles, "
-        "audience questions, and competitor themes that go BEYOND the topics already in their internal data. "
-        "For each, note why it is gaining traction now. "
-        "(2) Then map these back to the internal data — call out explicitly which are gaps (popular outside, "
-        "absent from their current themes) versus topics they already cover. "
-        "Use bullet points. Reference specific external benchmarks or numbers, then contrast with the internal numbers. "
-        "If recommending a topic or campaign tactic, explain WHY it is a fresh opportunity this team is not already pursuing."
+        f"{structure_instruction} "
+        "Use bullet points. Reference specific numbers. Keep the answer proportional to the question — "
+        "never force a long analysis onto a narrow question."
+    )
+
+    language_instruction = (
+        "CRITICAL LANGUAGE RULE: Write your ENTIRE response in the SAME LANGUAGE as the user's "
+        "message above. If the user wrote in Indonesian (Bahasa Indonesia), answer fully in "
+        "Indonesian; if in English, answer in English. Do not switch languages mid-answer. "
+        "Keep the '**Sources:**' label and the emoji source lines exactly as specified, but write "
+        "all narrative/insight text in the user's language."
     )
 
     full_prompt = (
@@ -489,6 +579,7 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
         f'- Always include: "📊 Internal scraped data · {brand_a} & {brand_b} · {period}"\n'
         + ('- For each web result that contributed: "🌐 [title](url)"\n' if has_web else "")
         + ('- For each news article that contributed, cite it as "🌐 [title](url)"\n' if has_news else "")
+        + f"\n{language_instruction}"
         + "\nAssistant:"
     )
 
@@ -592,6 +683,7 @@ def run_agentic_chat(
         "context_block": context_block,
         "context_data": context_data,
         "context_meta": context_meta,
+        "intent": "specific",
         "needs_web_search": False,
         "needs_visualization": False,
         "needs_news": False,

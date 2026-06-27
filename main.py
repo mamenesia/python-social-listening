@@ -1102,6 +1102,9 @@ class SocialListeningContext(BaseModel):
     follower_ratio: float = 1.0
     post_ratio: float = 1.0
     period: str = ""
+    # Optional per-post samples for posting-time analysis. Each item ideally has
+    # {side, username, engagement, timestamp}. timestamp = ISO 8601 or epoch.
+    posts: list[dict] = []
 
 
 class SocialChatRequest(BaseModel):
@@ -1112,6 +1115,107 @@ class SocialChatRequest(BaseModel):
 
 class SocialChatResponse(BaseModel):
     response: str
+
+
+# --- Posting-time analysis from scraped posts (real data, not generic benchmarks) ---
+_DAY_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]  # weekday() 0=Mon
+
+
+def _parse_post_timestamp(value):
+    """Parse a post timestamp (ISO 8601 string or epoch sec/ms) into an aware UTC datetime."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1e11:  # milliseconds
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        s = str(value).strip()
+        if not s:
+            return None
+        if s.isdigit():
+            return _parse_post_timestamp(int(s))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def analyze_posting_times(posts, min_posts: int = 5):
+    """Bucket scraped posts by WIB day-of-week and hour, weighted by engagement.
+
+    Returns a summary dict, or None when there isn't enough timestamped data.
+    """
+    from datetime import timedelta
+    wib = timezone(timedelta(hours=7))
+
+    rows = []
+    for p in posts or []:
+        if not isinstance(p, dict):
+            continue
+        ts = (p.get("timestamp") or p.get("uploaded_at") or p.get("taken_at")
+              or p.get("date") or p.get("created_at"))
+        dt = _parse_post_timestamp(ts)
+        if dt is None:
+            continue
+        eng = p.get("engagement")
+        if eng is None:
+            eng = (p.get("likes") or 0) + (p.get("comments") or 0)
+        try:
+            eng = float(eng)
+        except Exception:
+            eng = 0.0
+        rows.append((dt.astimezone(wib), eng, p.get("side", ""), p.get("username", "")))
+
+    if len(rows) < min_posts:
+        return None
+
+    day_eng, day_cnt, hour_eng, hour_cnt = {}, {}, {}, {}
+    for dt, eng, _s, _u in rows:
+        d, h = dt.weekday(), dt.hour
+        day_eng[d] = day_eng.get(d, 0.0) + eng
+        day_cnt[d] = day_cnt.get(d, 0) + 1
+        hour_eng[h] = hour_eng.get(h, 0.0) + eng
+        hour_cnt[h] = hour_cnt.get(h, 0) + 1
+
+    day_avg = {k: day_eng[k] / day_cnt[k] for k in day_eng}
+    hour_avg = {k: hour_eng[k] / hour_cnt[k] for k in hour_eng}
+    best_days = sorted(day_avg, key=day_avg.get, reverse=True)[:3]
+    best_hours = sorted(hour_avg, key=hour_avg.get, reverse=True)[:4]
+    top_posts = sorted(rows, key=lambda r: r[1], reverse=True)[:5]
+
+    return {
+        "n": len(rows),
+        "best_days": [(_DAY_ID[d], round(day_avg[d]), day_cnt[d]) for d in best_days],
+        "best_hours": [(h, round(hour_avg[h]), hour_cnt[h]) for h in best_hours],
+        "top_posts": [
+            {"day": _DAY_ID[dt.weekday()], "hour": dt.hour, "engagement": round(eng),
+             "side": side, "username": u}
+            for dt, eng, side, u in top_posts
+        ],
+    }
+
+
+def format_posting_time_block(summary) -> str:
+    """Render the posting-time summary as a context block for the LLM, or '' if none."""
+    if not summary:
+        return ""
+    days = ", ".join(f"{d} (rata-rata {e} eng, {c} post)" for d, e, c in summary["best_days"])
+    hours = ", ".join(f"{h:02d}:00 (rata-rata {e} eng)" for h, e, _c in summary["best_hours"])
+    tops = "; ".join(
+        f"{tp['day']} jam {tp['hour']:02d}:00 — {tp['engagement']} eng (@{tp['username']})"
+        for tp in summary["top_posts"]
+    )
+    return (
+        "\n\n=== ANALISIS WAKTU POSTING (dihitung dari post ber-timestamp — DATA NYATA, "
+        "pakai ini untuk rekomendasi waktu) ===\n"
+        f"Berdasarkan {summary['n']} post viral ber-timestamp (akun terpantau + scan tren "
+        "konten viral Indonesia), zona WIB:\n"
+        f"- Hari terbaik (rata-rata engagement): {days}\n"
+        f"- Jam terbaik (rata-rata engagement): {hours}\n"
+        f"- Post viral (engagement tertinggi) diupload pada: {tops}\n"
+    )
 
 
 @app.post("/api/v1/chat")
@@ -1192,6 +1296,15 @@ async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
         context_data = {}
         context_meta = {"period": "current period", "brand_a_name": "Kalventis", "brand_b_name": "GSK"}
 
+    # Ground "best time to post" answers in REAL post-level data when the
+    # frontend sends per-post timestamps; otherwise this is a no-op and the
+    # model falls back to external benchmarks.
+    if ctx and getattr(ctx, "posts", None):
+        posting_summary = analyze_posting_times(ctx.posts)
+        if posting_summary:
+            context_block += format_posting_time_block(posting_summary)
+            logger.info("[chat] posting-time analysis added (%d timestamped posts)", posting_summary["n"])
+
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
     try:
@@ -1228,6 +1341,9 @@ class MonitoringChatContext(BaseModel):
     top_comments: list[dict] = []
     coverage: dict = {}
     period: str = ""
+    # Optional per-post samples for posting-time analysis. Each item ideally has
+    # {side, username, engagement, timestamp}. timestamp = ISO 8601 or epoch.
+    posts: list[dict] = []
 
 
 class MonitoringChatRequest(BaseModel):
@@ -1333,6 +1449,14 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
         )
         context_data = {}
         context_meta = {"period": "current period", "brand_a_name": "Brand A", "brand_b_name": "Brand B"}
+
+    # Ground "best time to post" answers in REAL post-level data when the frontend
+    # sends per-post timestamps; otherwise this is a no-op (falls back to benchmarks).
+    if ctx and getattr(ctx, "posts", None):
+        posting_summary = analyze_posting_times(ctx.posts)
+        if posting_summary:
+            context_block += format_posting_time_block(posting_summary)
+            logger.info("[monitoring_chat] posting-time analysis added (%d timestamped posts)", posting_summary["n"])
 
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
