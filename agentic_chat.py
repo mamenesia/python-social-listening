@@ -543,15 +543,19 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
             "did not ask about, even if the web/news results below contain them — ignore any off-topic "
             "material. Lead with the concrete answer and numbers, focused only on the platforms the brand "
             "actually uses (Instagram, TikTok, YouTube — never X/Twitter). "
-            "For best time/day to post: if an 'ANALISIS WAKTU POSTING' block (computed from the brand's own "
-            "scraped posts) is present in the context, BASE your day/hour recommendation primarily on THAT "
-            "real data — cite the actual best days/hours and the viral posts' upload times from it — and use "
-            "external benchmarks only as secondary support. If that block is absent, fall back to benchmarks. "
+            "For best time/day to post: BASE your day/hour recommendation primarily on external public "
+            "benchmarks and industry best-practice data (web/news results) — the digital marketing team "
+            "already knows their own numbers, so external research is the priority, not internal data. "
+            "Give specific days and hours in WIB per relevant platform, and end with a short concrete posting "
+            "schedule recommendation, all grounded in the external benchmarks. "
+            "Only AFTER that full external-benchmark recommendation, if an 'ANALISIS WAKTU POSTING' block "
+            "(computed from the brand's own scraped posts) is present in the context, add ONE short closing "
+            "paragraph (a sentence or two, never a full repeat of the breakdown) that briefly mentions the "
+            "internal data purely as a secondary confirmation/contrast, clearly placed last. If that internal "
+            "block is absent, simply omit this closing paragraph. "
             "NEVER guess or fabricate the upload day/time of individual posts (do NOT write things like a post "
             "was 'probably posted at 10-12'), and never claim internal posts 'confirm' a time unless their real "
-            "timestamps are actually provided. "
-            "Give specific days and hours in WIB per relevant platform, and end with a short concrete posting "
-            "schedule recommendation."
+            "timestamps are actually provided."
         )
 
     answer_instructions = (
@@ -571,14 +575,14 @@ def synthesize_node(state: AgenticChatState) -> AgenticChatState:
 
     full_prompt = (
         f"{system_persona}\n\n"
-        f"{state['context_block']}{web_block}{news_block}{viral_block}\n\n"
+        f"{web_block}{news_block}{viral_block}{state['context_block']}\n\n"
         f"{history_block}\n\n"
         f"User: {state['message']}\n\n"
         f"{answer_instructions}\n\n"
-        f'After your answer add a "---" divider then a "**Sources:**" section:\n'
-        f'- Always include: "📊 Internal scraped data · {brand_a} & {brand_b} · {period}"\n'
+        f'After your answer add a "---" divider then a "**Sources:**" section, external sources FIRST:\n'
         + ('- For each web result that contributed: "🌐 [title](url)"\n' if has_web else "")
         + ('- For each news article that contributed, cite it as "🌐 [title](url)"\n' if has_news else "")
+        + f'- Last, always include: "📊 Internal scraped data · {brand_a} & {brand_b} · {period}"\n'
         + f"\n{language_instruction}"
         + "\nAssistant:"
     )
