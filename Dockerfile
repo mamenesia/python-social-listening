@@ -10,9 +10,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Bake IndoBERT into the image so runtime needs no internet access
-RUN git clone --depth 1 https://huggingface.co/mdhugol/indonesia-bert-sentiment-classification \
+RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install \
+    && git clone --depth 1 https://huggingface.co/mdhugol/indonesia-bert-sentiment-classification \
     /indonesia-bert-sentiment-classification \
-    && git -C /indonesia-bert-sentiment-classification checkout "$INDOBERT_MODEL_REVISION"
+    && git -C /indonesia-bert-sentiment-classification checkout "$INDOBERT_MODEL_REVISION" \
+    && git -C /indonesia-bert-sentiment-classification lfs pull \
+    && python -c "from pathlib import Path; assert Path('/indonesia-bert-sentiment-classification/pytorch_model.bin').stat().st_size > 100_000_000, 'Missing model weights'"
 
 COPY . .
 
