@@ -7,7 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Inference uses device=-1. Keep the production versions without downloading
+# unused CUDA packages that exhaust the VPS during a rolling build.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+    torch==2.14.1+cpu torchvision==0.29.1+cpu \
+    && pip install --no-cache-dir -r requirements.txt \
+    && python -c "import torch; assert torch.version.cuda is None, 'Expected CPU-only PyTorch'"
 
 # Bake IndoBERT into the image so runtime needs no internet access
 RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
