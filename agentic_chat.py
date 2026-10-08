@@ -72,7 +72,8 @@ def _build_df(context_data: dict) -> pd.DataFrame:
             neg = sent.get("negative", 0)
         rows.append({
             "brand": name,
-            "followers": bd.get("followers", 0),
+            "followers": bd.get("followers"),
+            "followers_approximate": bd.get("followers_approximate", False),
             "posts_scraped": bd.get("posts_scraped", 0),
             "avg_likes": bd.get("avg_likes", 0),
             "total_engagement": bd.get("total_engagement", 0),
@@ -362,6 +363,9 @@ def visualize_node(state: AgenticChatState) -> AgenticChatState:
             f"  followers = df['followers'].tolist()  # → {df['followers'].tolist()}\n"
             "  Do NOT use df.loc[brand_name, col] — the index is 0, 1, not brand names.\n"
             "  Use df['column'].tolist() or df['column'].values to extract data.\n\n"
+            "  Missing/NaN followers are unavailable, not zero: do not fill them or compute ratios from them.\n"
+            "  Label followers and derived ratios approximate when followers_approximate is true.\n"
+            "  Never divide by zero; keep other metrics available.\n"
             "Styling rules:\n"
             "  - Figure size: fig, ax = plt.subplots(figsize=(7, 4))\n"
             "  - Brand colors: '#2557d6' first brand, '#12a594' second brand\n"

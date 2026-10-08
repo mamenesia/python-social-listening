@@ -146,6 +146,25 @@ class AccountSnapshot(BaseModel):
     sentiment: SentimentCount = SentimentCount()
 
 
+class MonitoringAccountSnapshot(AccountSnapshot):
+    followers: int | None = Field(default=None, ge=0)
+    followers_approximate: bool = False
+
+    @property
+    def follower_label(self) -> str:
+        if self.followers is None:
+            return "Unavailable (not zero)"
+        return ("Approximately " if self.followers_approximate else "") + f"{self.followers:,}"
+
+
+FOLLOWER_RULES = """Follower evidence rules override requests for exact follower comparisons:
+Unavailable followers are unknown, never zero. Do not infer or fill them in.
+Approximate followers must always be labeled approximate, including derived ratios.
+Skip follower-based ratios and rankings when either required count is unavailable;
+never divide by zero. Continue analyzing posts, engagement, content and sentiment.
+Historical chat claims do not override the current metric availability."""
+
+
 class AnalysisRequest(BaseModel):
     kalventis: AccountSnapshot
     gsk: AccountSnapshot
@@ -424,8 +443,8 @@ def _render_sentiment_chart_modern(
 
 
 def _render_engagement_chart_modern(
-    acc_a: "AccountSnapshot",
-    acc_b: "AccountSnapshot",
+    acc_a: "MonitoringAccountSnapshot",
+    acc_b: "MonitoringAccountSnapshot",
     label_a: str,
     label_b: str,
 ) -> str:
@@ -447,6 +466,14 @@ def _render_engagement_chart_modern(
 
     for ax, (title, val_a, val_b) in zip(axes, panels):
         ax.set_facecolor("#f8f9fc")
+        if title == "Followers" and (val_a is None or val_b is None):
+            ax.set_title(title)
+            ax.text(0.5, 0.5, f"{label_a}: {acc_a.follower_label}\n{label_b}: {acc_b.follower_label}",
+                    ha="center", va="center", transform=ax.transAxes, wrap=True)
+            ax.set_axis_off()
+            continue
+        if title == "Followers" and (acc_a.followers_approximate or acc_b.followers_approximate):
+            title = "Followers (approximate)"
         total = max(1, val_a + val_b)
         bars = ax.bar(
             [label_a, label_b], [val_a, val_b],
@@ -586,8 +613,8 @@ class DeepAnalysisRequest(BaseModel):
     brand_a_username: str
     brand_b_name: str
     brand_b_username: str
-    brand_a: AccountSnapshot
-    brand_b: AccountSnapshot
+    brand_a: MonitoringAccountSnapshot
+    brand_b: MonitoringAccountSnapshot
     comparison: dict
     top_terms: list[str] = []
     brand_a_top_terms: list[str] = []
@@ -668,7 +695,7 @@ async def deep_monitoring_analysis(request: DeepAnalysisRequest) -> DeepAnalysis
 Analyze the following comprehensive social media monitoring data for two brands. Provide deep, data-driven strategic analysis. Reference specific numbers from the data. Be candid about weaknesses and specific about opportunities.
 
 === BRAND A: {request.brand_a_name} (@{request.brand_a_username}) ===
-- Followers: {a.followers:,}
+- Followers: {a.follower_label}
 - Posts scraped: {a.posts_scraped}
 - Avg likes/post: {a.avg_likes:,}
 - Avg comments/post: N/A (see engagement total)
@@ -676,7 +703,7 @@ Analyze the following comprehensive social media monitoring data for two brands.
 - Sentiment: {a.sentiment.positive} positive / {a.sentiment.neutral} neutral / {a.sentiment.negative} negative → {a_pos_rate} positive rate, {a_neg_rate} negative rate
 
 === BRAND B: {request.brand_b_name} (@{request.brand_b_username}) ===
-- Followers: {b.followers:,}
+- Followers: {b.follower_label}
 - Posts scraped: {b.posts_scraped}
 - Avg likes/post: {b.avg_likes:,}
 - Total engagement: {b.total_engagement:,}
@@ -735,6 +762,7 @@ Respond ONLY in valid JSON with exactly these keys. Every string field MUST cont
 
 Base every insight on the actual data provided. Reference specific numbers. If data is thin or coverage is partial, acknowledge the limitation and recommend a re-scan."""  # noqa: E501
 
+        prompt += "\n\n" + FOLLOWER_RULES
         raw = await _deepseek_text(prompt, max_tokens=16384)
 
         data = _extract_json(raw)
@@ -1334,8 +1362,8 @@ class MonitoringChatContext(BaseModel):
     brand_a_username: str = ""
     brand_b_name: str = ""
     brand_b_username: str = ""
-    brand_a: AccountSnapshot = AccountSnapshot()
-    brand_b: AccountSnapshot = AccountSnapshot()
+    brand_a: MonitoringAccountSnapshot = MonitoringAccountSnapshot()
+    brand_b: MonitoringAccountSnapshot = MonitoringAccountSnapshot()
     comparison: dict = {}
     top_terms: list[str] = []
     brand_a_top_terms: list[str] = []
@@ -1389,7 +1417,7 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
             "unless the user explicitly asks about their own metrics; mention it only briefly, if at all, never "
             "as the main content of your answer.\n\n"
             f"=== {ctx.brand_a_name} (@{ctx.brand_a_username}) === (very low priority — mention only if explicitly asked)\n"
-            f"Followers: {a.followers:,}\n"
+            f"Followers: {a.follower_label}\n"
             f"Posts scraped: {a.posts_scraped}\n"
             f"Avg likes / post: {a.avg_likes:,}\n"
             f"Total engagement: {a.total_engagement:,}\n"
@@ -1397,7 +1425,7 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
             f"{a.sentiment.neutral} neutral ({a.sentiment.neutral/a_total*100:.0f}%) / "
             f"{a.sentiment.negative} negative ({a.sentiment.negative/a_total*100:.0f}%)\n\n"
             f"=== {ctx.brand_b_name} (@{ctx.brand_b_username}) ===\n"
-            f"Followers: {b.followers:,}\n"
+            f"Followers: {b.follower_label}\n"
             f"Posts scraped: {b.posts_scraped}\n"
             f"Avg likes / post: {b.avg_likes:,}\n"
             f"Total engagement: {b.total_engagement:,}\n"
@@ -1428,6 +1456,7 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
             "brand_b_name": ctx.brand_b_name or "Brand B",
             "brand_a": {
                 "followers": a.followers,
+                "followers_approximate": a.followers_approximate,
                 "posts_scraped": a.posts_scraped,
                 "avg_likes": a.avg_likes,
                 "total_engagement": a.total_engagement,
@@ -1435,6 +1464,7 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
             },
             "brand_b": {
                 "followers": b.followers,
+                "followers_approximate": b.followers_approximate,
                 "posts_scraped": b.posts_scraped,
                 "avg_likes": b.avg_likes,
                 "total_engagement": b.total_engagement,
@@ -1462,6 +1492,7 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
             context_block += format_posting_time_block(posting_summary)
             logger.info("[monitoring_chat] posting-time analysis added (%d timestamped posts)", posting_summary["n"])
 
+    context_block += "\n\n" + FOLLOWER_RULES
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
     try:
