@@ -32,9 +32,10 @@ def test_monitoring_accepts_follower_evidence(monkeypatch, count, approximate, l
         "brand_a_name": "Alpha", "brand_a_username": "alpha",
         "brand_b_name": "Beta", "brand_b_username": "beta",
         "brand_a": {"followers": count, "followers_approximate": approximate,
+                    "posts_scraped": 11,
                     "total_engagement": 137, "avg_likes": 19,
                     "sentiment": {"positive": 7, "neutral": 3, "negative": 1}},
-        "brand_b": {"followers": 913, "total_engagement": 61},
+        "brand_b": {"followers": 913, "posts_scraped": 1, "total_engagement": 61},
         "comparison": {},
         "coverage": {},
     }
@@ -70,8 +71,8 @@ def test_chart_preserves_other_metrics(monkeypatch, count, approximate):
     figures = []
     monkeypatch.setattr(main, "_fig_to_b64", lambda fig: figures.append(fig) or "chart")
     a = main.MonitoringAccountSnapshot(followers=count, followers_approximate=approximate,
-                                       total_engagement=137, avg_likes=19)
-    b = main.MonitoringAccountSnapshot(followers=913, total_engagement=61, avg_likes=5)
+                                       posts_scraped=1, total_engagement=137, avg_likes=19)
+    b = main.MonitoringAccountSnapshot(followers=913, posts_scraped=1, total_engagement=61, avg_likes=5)
     main._render_engagement_chart_modern(a, b, "Alpha", "Beta")
     followers, engagement, likes = figures[0].axes
     assert [bar.get_height() for bar in engagement.patches] == [137, 61]

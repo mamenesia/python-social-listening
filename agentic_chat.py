@@ -75,8 +75,9 @@ def _build_df(context_data: dict) -> pd.DataFrame:
             "followers": bd.get("followers"),
             "followers_approximate": bd.get("followers_approximate", False),
             "posts_scraped": bd.get("posts_scraped", 0),
-            "avg_likes": bd.get("avg_likes", 0),
-            "total_engagement": bd.get("total_engagement", 0),
+            "engagement_measured_posts": bd.get("engagement_measured_posts", bd.get("posts_scraped", 0)),
+            "avg_likes": None if bd.get("engagement_measured_posts") == 0 else bd.get("avg_likes", 0),
+            "total_engagement": None if bd.get("engagement_measured_posts") == 0 else bd.get("total_engagement", 0),
             "positive_sentiment": pos,
             "neutral_sentiment": neu,
             "negative_sentiment": neg,
@@ -364,6 +365,12 @@ def visualize_node(state: AgenticChatState) -> AgenticChatState:
             "  Do NOT use df.loc[brand_name, col] — the index is 0, 1, not brand names.\n"
             "  Use df['column'].tolist() or df['column'].values to extract data.\n\n"
             "  Missing/NaN followers are unavailable, not zero: do not fill them or compute ratios from them.\n"
+            "  Missing/NaN engagement is unavailable, never fill with zero. Explicit zero measured posts means no measurements.\n"
+            "  Total engagement and avg_likes cover engagement_measured_posts ONLY; use that count for averages.\n"
+            "  Label partial coverage succinctly as 'Measured n/N posts' when measured < posts_scraped.\n"
+            "  Unavailable metrics should get an unknown panel, retaining other valid panels.\n"
+            "  Do not infer reach or rankings across unavailable metrics; skip invalid ratios.\n"
+            "  Sentiment and content use all retained posts, not just measured engagement.\n"
             "  Label followers and derived ratios approximate when followers_approximate is true.\n"
             "  Never divide by zero; keep other metrics available.\n"
             "Styling rules:\n"

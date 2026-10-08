@@ -12,7 +12,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import base64
 import io
@@ -141,9 +141,27 @@ class SentimentCount(BaseModel):
 class AccountSnapshot(BaseModel):
     followers: int = 0
     posts_scraped: int = 0
-    avg_likes: int = 0
-    total_engagement: int = 0
+    avg_likes: float | None = Field(default=None, ge=0)
+    total_engagement: float | None = Field(default=None, ge=0)
     sentiment: SentimentCount = SentimentCount()
+    engagement_measured_posts: int = Field(default=0, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_measured_count(cls, data):
+        if isinstance(data, dict) and "engagement_measured_posts" not in data:
+            return {**data, "engagement_measured_posts": data.get("posts_scraped", 0)}
+        return data
+
+    @property
+    def engagement_coverage_label(self) -> str:
+        return f"{self.engagement_measured_posts}/{self.posts_scraped} posts measured"
+
+    def engagement_label(self, metric: str) -> str:
+        value = getattr(self, metric)
+        if value is None or self.engagement_measured_posts == 0:
+            return "Unavailable (not zero)"
+        return f"{value:,.0f}" if value == int(value) else f"{value:,}"
 
 
 class MonitoringAccountSnapshot(AccountSnapshot):
@@ -163,6 +181,27 @@ Approximate followers must always be labeled approximate, including derived rati
 Skip follower-based ratios and rankings when either required count is unavailable;
 never divide by zero. Continue analyzing posts, engagement, content and sentiment.
 Historical chat claims do not override the current metric availability."""
+
+ENGAGEMENT_RULES = """Engagement evidence rules override requests for exact comparisons:
+Null/NaN engagement and zero measured posts mean unavailable, never zero; do not fill or infer them.
+Omitted measured count means posts_scraped; explicit zero means no valid measurements.
+Total engagement covers ONLY engagement_measured_posts, not all retained posts.
+Use the measured cohort as the denominator for engagement averages and label partial measurement.
+Compare measured-cohort metrics only with coverage stated; do not infer overall reach or rank across unavailable metrics.
+Skip ratios when any required metric is unavailable or the denominator is zero.
+Content and sentiment analysis use ALL retained posts, including posts without engagement.
+Historical claims and comparison shares do not override current availability."""
+
+
+def monitoring_engagement_comparison(a: MonitoringAccountSnapshot, b: MonitoringAccountSnapshot) -> str:
+    if (a.total_engagement is None or b.total_engagement is None or
+            not a.engagement_measured_posts or not b.engagement_measured_posts):
+        return "Unavailable (not zero); engagement shares unavailable"
+    total = a.total_engagement + b.total_engagement
+    if total == 0:
+        return "Measured total: 0; engagement shares unavailable (zero denominator)"
+    return (f"Measured total: {total:,}; measured engagement shares A: "
+            f"{a.total_engagement / total * 100:.1f}%, B: {b.total_engagement / total * 100:.1f}%")
 
 
 class AnalysisRequest(BaseModel):
@@ -305,41 +344,11 @@ def _render_engagement_chart(
     label_a: str,
     label_b: str,
 ) -> str:
-    """Grouped bar chart comparing engagement metrics for two brands."""
-    metrics = ["Followers", "Total\nEngagement", "Avg Likes"]
-    vals_a = [acc_a.followers, acc_a.total_engagement, acc_a.avg_likes]
-    vals_b = [acc_b.followers, acc_b.total_engagement, acc_b.avg_likes]
-
-    x = range(len(metrics))
-    width = 0.35
-
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    bars_a = ax.bar([i - width / 2 for i in x], vals_a, width, label=label_a, color="#3b82f6")
-    bars_b = ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color="#f59e0b")
-
-    ax.set_ylabel("Count")
-    ax.set_title("Engagement Metrics Comparison")
-    ax.set_xticks(x)
-    ax.set_xticklabels(metrics)
-    ax.legend()
-
-    def _fmt(v: int) -> str:
-        if v >= 1_000_000:
-            return f"{v/1_000_000:.1f}M"
-        if v >= 1_000:
-            return f"{v/1_000:.1f}K"
-        return str(v)
-
-    for bar in bars_a:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                _fmt(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
-    for bar in bars_b:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                _fmt(int(bar.get_height())), ha="center", va="bottom", fontsize=8)
-
-    b64 = _fig_to_b64(fig)
-    plt.close(fig)
-    return b64
+    """Reuse the availability-aware panels for dashboard analysis."""
+    return _render_engagement_chart_modern(
+        MonitoringAccountSnapshot(**acc_a.model_dump()),
+        MonitoringAccountSnapshot(**acc_b.model_dump()), label_a, label_b,
+    )
 
 
 
@@ -466,11 +475,24 @@ def _render_engagement_chart_modern(
 
     for ax, (title, val_a, val_b) in zip(axes, panels):
         ax.set_facecolor("#f8f9fc")
-        if title == "Followers" and (val_a is None or val_b is None):
+        if title != "Followers":
+            val_a = val_a if acc_a.engagement_measured_posts else None
+            val_b = val_b if acc_b.engagement_measured_posts else None
+            if (acc_a.engagement_measured_posts < acc_a.posts_scraped or
+                    acc_b.engagement_measured_posts < acc_b.posts_scraped):
+                ax.set_xlabel(f"Measured: {acc_a.engagement_measured_posts}/{acc_a.posts_scraped} | "
+                              f"{acc_b.engagement_measured_posts}/{acc_b.posts_scraped}", fontsize=8)
+                title += " (partial)"
+        if val_a is None or val_b is None:
             ax.set_title(title)
-            ax.text(0.5, 0.5, f"{label_a}: {acc_a.follower_label}\n{label_b}: {acc_b.follower_label}",
+            labels = ([acc_a.follower_label, acc_b.follower_label] if title == "Followers" else
+                      ["Unavailable (not zero)" if v is None else _fmt(v) for v in (val_a, val_b)])
+            ax.text(0.5, 0.5, f"{label_a}: {labels[0]}\n{label_b}: {labels[1]}",
                     ha="center", va="center", transform=ax.transAxes, wrap=True)
-            ax.set_axis_off()
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
             continue
         if title == "Followers" and (acc_a.followers_approximate or acc_b.followers_approximate):
             title = "Followers (approximate)"
@@ -538,15 +560,17 @@ Analyze the following social listening data and provide strategic insights. Be s
 KALVENTIS (@kenapaharusvaksin) — Owned Brand:
 - Followers: {kv.followers:,}
 - Posts scraped: {kv.posts_scraped}
-- Avg likes/post: {kv.avg_likes}
-- Total engagement: {kv.total_engagement:,}
+- Engagement coverage: {kv.engagement_coverage_label}
+- Avg likes/post (measured): {kv.engagement_label('avg_likes')}
+- Total engagement (measured): {kv.engagement_label('total_engagement')}
 - Sentiment: {kv.sentiment.positive} positive / {kv.sentiment.neutral} neutral / {kv.sentiment.negative} negative → {kv_pos_rate} positive rate
 
 GSK (@ayokitavaksin) — Competitor:
 - Followers: {gsk.followers:,}
 - Posts scraped: {gsk.posts_scraped}
-- Avg likes/post: {gsk.avg_likes}
-- Total engagement: {gsk.total_engagement:,}
+- Engagement coverage: {gsk.engagement_coverage_label}
+- Avg likes/post (measured): {gsk.engagement_label('avg_likes')}
+- Total engagement (measured): {gsk.engagement_label('total_engagement')}
 - Sentiment: {gsk.sentiment.positive} positive / {gsk.sentiment.neutral} neutral / {gsk.sentiment.negative} negative → {gsk_pos_rate} positive rate
 
 COMPETITIVE RATIOS:
@@ -571,7 +595,7 @@ Respond ONLY in valid JSON with exactly these keys (no markdown, no code blocks)
 
 Focus on vaccine awareness, public health education in Indonesia, and practical content strategy advice."""
 
-        raw = await _deepseek_text(prompt)
+        raw = await _deepseek_text(prompt + "\n\n" + ENGAGEMENT_RULES)
         data = _extract_json(raw)
 
 
@@ -672,7 +696,7 @@ async def deep_monitoring_analysis(request: DeepAnalysisRequest) -> DeepAnalysis
 
         comp = request.comparison
         top_posts_text = "\n".join(
-            f"  [{p.get('side','')}] @{p.get('username','')}: \"{p.get('caption','')[:200]}\" — {p.get('engagement',0)} engagement, sentiment: {p.get('sentiment','Neutral')}"
+            f"  [{p.get('side','')}] @{p.get('username','')}: \"{p.get('caption','')[:200]}\" — {p.get('engagement') if p.get('engagement') is not None else 'Unavailable'} engagement, sentiment: {p.get('sentiment','Neutral')}"
             for p in request.top_posts[:10]
         ) if request.top_posts else "No post samples available"
 
@@ -697,22 +721,22 @@ Analyze the following comprehensive social media monitoring data for two brands.
 === BRAND A: {request.brand_a_name} (@{request.brand_a_username}) ===
 - Followers: {a.follower_label}
 - Posts scraped: {a.posts_scraped}
-- Avg likes/post: {a.avg_likes:,}
+- Engagement measurement: {a.engagement_coverage_label}
+- Avg likes/post (measured): {a.engagement_label('avg_likes')}
 - Avg comments/post: N/A (see engagement total)
-- Total engagement: {a.total_engagement:,}
+- Total engagement (measured): {a.engagement_label('total_engagement')}
 - Sentiment: {a.sentiment.positive} positive / {a.sentiment.neutral} neutral / {a.sentiment.negative} negative → {a_pos_rate} positive rate, {a_neg_rate} negative rate
 
 === BRAND B: {request.brand_b_name} (@{request.brand_b_username}) ===
 - Followers: {b.follower_label}
 - Posts scraped: {b.posts_scraped}
-- Avg likes/post: {b.avg_likes:,}
-- Total engagement: {b.total_engagement:,}
+- Engagement measurement: {b.engagement_coverage_label}
+- Avg likes/post (measured): {b.engagement_label('avg_likes')}
+- Total engagement (measured): {b.engagement_label('total_engagement')}
 - Sentiment: {b.sentiment.positive} positive / {b.sentiment.neutral} neutral / {b.sentiment.negative} negative → {b_pos_rate} positive rate, {b_neg_rate} negative rate
 
 === COMPETITIVE COMPARISON ===
-- Total engagement across both brands: {comp.get('engagementTotal', 0):,}
-- {request.brand_a_name} engagement share: {comp.get('brandAEngagementShare', 0)}%
-- {request.brand_b_name} engagement share: {comp.get('brandBEngagementShare', 0)}%
+- Engagement comparison: {monitoring_engagement_comparison(a, b)}
 - {request.brand_a_name} post share: {comp.get('brandAPostShare', 0)}%
 - {request.brand_b_name} post share: {comp.get('brandBPostShare', 0)}%
 
@@ -762,7 +786,7 @@ Respond ONLY in valid JSON with exactly these keys. Every string field MUST cont
 
 Base every insight on the actual data provided. Reference specific numbers. If data is thin or coverage is partial, acknowledge the limitation and recommend a re-scan."""  # noqa: E501
 
-        prompt += "\n\n" + FOLLOWER_RULES
+        prompt += "\n\n" + FOLLOWER_RULES + "\n\n" + ENGAGEMENT_RULES
         raw = await _deepseek_text(prompt, max_tokens=16384)
 
         data = _extract_json(raw)
@@ -821,8 +845,8 @@ Base every insight on the actual data provided. Reference specific numbers. If d
 
 class KalventisPost(BaseModel):
     caption: str
-    likes: int = 0
-    comments: int = 0
+    likes: int | None = Field(default=None, ge=0)
+    comments: int | None = Field(default=None, ge=0)
     type: str = "image"
 
 
@@ -856,7 +880,7 @@ async def kalventis_overview_analysis(request: KalventisAnalysisRequest) -> Kalv
     try:
         posts_sample = request.posts[:15]
         posts_text = "\n".join(
-            f"[{i+1}] {p.type}: {p.likes} likes, {p.comments} comments - {p.caption[:100]}"
+            f"[{i+1}] {p.type}: {p.likes if p.likes is not None else 'Unavailable'} likes, {p.comments if p.comments is not None else 'Unavailable'} comments - {p.caption[:100]}"
             for i, p in enumerate(posts_sample)
         )
         period_label = request.period or 'recent window'
@@ -970,7 +994,7 @@ async def _analyse_chart_vision(b64: str, title: str) -> str:
             "In 2-3 concise sentences, describe the key insight this chart reveals "
             "and what it means for the brand's content strategy."
         )
-        return await _deepseek_text(prompt)
+        return await _deepseek_text(prompt + "\n\n" + ENGAGEMENT_RULES)
     except Exception as e:
         logger.error(f"Vision analysis failed for '{title}': {e}")
         return ""
@@ -1021,8 +1045,8 @@ async def full_analysis(request: FullAnalysisRequest) -> FullAnalysisResponse:
     competitive_prompt = f"""You are a senior social media analyst for Kalventis, an Indonesian vaccine awareness brand.
 Analyze the following social listening data and respond ONLY in valid JSON (no markdown):
 
-KALVENTIS (@kenapaharusvaksin) — Owned: Followers {kv.followers:,} | Posts {kv.posts_scraped} | Avg likes {kv.avg_likes} | Engagement {kv.total_engagement:,} | Sentiment {kv_pos_rate} positive
-GSK (@ayokitavaksin) — Competitor: Followers {gsk.followers:,} | Posts {gsk.posts_scraped} | Avg likes {gsk.avg_likes} | Engagement {gsk.total_engagement:,} | Sentiment {gsk_pos_rate} positive
+KALVENTIS (@kenapaharusvaksin) — Owned: Followers {kv.followers:,} | Posts {kv.posts_scraped} | {kv.engagement_coverage_label} | Avg likes {kv.engagement_label('avg_likes')} | Engagement {kv.engagement_label('total_engagement')} | Sentiment {kv_pos_rate} positive
+GSK (@ayokitavaksin) — Competitor: Followers {gsk.followers:,} | Posts {gsk.posts_scraped} | {gsk.engagement_coverage_label} | Avg likes {gsk.engagement_label('avg_likes')} | Engagement {gsk.engagement_label('total_engagement')} | Sentiment {gsk_pos_rate} positive
 Follower ratio: {request.follower_ratio:.1f}x | Post ratio: {request.post_ratio:.1f}x
 Topics: {', '.join(request.top_topics[:8]) or 'N/A'} | News monitored: {request.news_count}
 Top terms: {', '.join(request.top_words[:10]) or 'N/A'} | Period: {request.period}
@@ -1042,7 +1066,7 @@ Top terms: {', '.join(request.top_words[:10]) or 'N/A'} | Period: {request.perio
 
     # --- Topic / content analysis ---
     posts_text = "\n".join(
-        f"[{i+1}] {p.likes}L {p.comments}C — {p.caption[:120]}"
+        f"[{i+1}] {p.likes if p.likes is not None else 'Unavailable'}L {p.comments if p.comments is not None else 'Unavailable'}C — {p.caption[:120]}"
         for i, p in enumerate(request.posts[:15])
     ) or "No posts available"
 
@@ -1061,14 +1085,14 @@ Top terms: {', '.join(request.top_words[:10]) or 'N/A'} | Period: {request.perio
     topic_data: dict = {}
 
     try:
-        comp_data = _extract_json(await _deepseek_text(competitive_prompt))
+        comp_data = _extract_json(await _deepseek_text(competitive_prompt + "\n\n" + ENGAGEMENT_RULES))
     except Exception as e:
         logger.error(f"Competitive analysis error: {e}")
         comp_data = {"analysis_text": f"Analysis unavailable: {e}", "key_findings": [],
                      "recommendations": [], "risk_indicators": [], "opportunities": []}
 
     try:
-        topic_data = _extract_json(await _deepseek_text(topic_prompt))
+        topic_data = _extract_json(await _deepseek_text(topic_prompt + "\n\n" + ENGAGEMENT_RULES))
     except Exception as e:
         logger.error(f"Topic analysis error: {e}")
         topic_data = {"topics": [], "content_summary": "", "patterns": [], "content_recommendations": []}
@@ -1116,13 +1140,15 @@ class ChatMessage(BaseModel):
 class SocialListeningContext(BaseModel):
     kalventis_followers: int = 0
     kalventis_posts: int = 0
-    kalventis_avg_likes: int = 0
-    kalventis_total_engagement: int = 0
+    kalventis_avg_likes: float | None = Field(default=None, ge=0)
+    kalventis_total_engagement: float | None = Field(default=None, ge=0)
+    kalventis_engagement_measured_posts: int | None = Field(default=None, ge=0)
     kalventis_sentiment: dict = {}
     gsk_followers: int = 0
     gsk_posts: int = 0
-    gsk_avg_likes: int = 0
-    gsk_total_engagement: int = 0
+    gsk_avg_likes: float | None = Field(default=None, ge=0)
+    gsk_total_engagement: float | None = Field(default=None, ge=0)
+    gsk_engagement_measured_posts: int | None = Field(default=None, ge=0)
     gsk_sentiment: dict = {}
     top_topics: list[str] = []
     top_words: list[str] = []
@@ -1133,6 +1159,17 @@ class SocialListeningContext(BaseModel):
     # Optional per-post samples for posting-time analysis. Each item ideally has
     # {side, username, engagement, timestamp}. timestamp = ISO 8601 or epoch.
     posts: list[dict] = []
+
+    def snapshot(self, brand: str) -> AccountSnapshot:
+        measured = getattr(self, f"{brand}_engagement_measured_posts")
+        return AccountSnapshot(
+            followers=getattr(self, f"{brand}_followers"),
+            posts_scraped=getattr(self, f"{brand}_posts"),
+            engagement_measured_posts=(getattr(self, f"{brand}_posts") if measured is None else measured),
+            avg_likes=getattr(self, f"{brand}_avg_likes"),
+            total_engagement=getattr(self, f"{brand}_total_engagement"),
+            sentiment=getattr(self, f"{brand}_sentiment"),
+        )
 
 
 class SocialChatRequest(BaseModel):
@@ -1170,7 +1207,7 @@ def _parse_post_timestamp(value):
         return None
 
 
-def analyze_posting_times(posts, min_posts: int = 5):
+def analyze_posting_times(posts, min_posts: int = 5, *, measured_only: bool = False):
     """Bucket scraped posts by WIB day-of-week and hour, weighted by engagement.
 
     Returns a summary dict, or None when there isn't enough timestamped data.
@@ -1188,6 +1225,11 @@ def analyze_posting_times(posts, min_posts: int = 5):
         if dt is None:
             continue
         eng = p.get("engagement")
+        if measured_only:
+            # Monitoring must not turn missing/negative counters into measured zeros.
+            import math
+            if not isinstance(eng, (int, float)) or not math.isfinite(eng) or eng < 0:
+                continue
         if eng is None:
             eng = (p.get("likes") or 0) + (p.get("comments") or 0)
         try:
@@ -1257,6 +1299,8 @@ async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
     if ctx:
         kv_sent = ctx.kalventis_sentiment
         gsk_sent = ctx.gsk_sentiment
+        kv = ctx.snapshot("kalventis")
+        gsk = ctx.snapshot("gsk")
         context_block = (
             "You are an expert social media analyst assistant for Kalventis, "
             "an Indonesian vaccine awareness brand (@kenapaharusvaksin).\n"
@@ -1269,15 +1313,17 @@ async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
             "=== KALVENTIS (@kenapaharusvaksin) ===\n"
             f"Followers: {ctx.kalventis_followers:,}\n"
             f"Posts scraped: {ctx.kalventis_posts}\n"
-            f"Avg likes/post: {ctx.kalventis_avg_likes}\n"
-            f"Total engagement: {ctx.kalventis_total_engagement:,}\n"
+            f"Engagement coverage: {kv.engagement_coverage_label}\n"
+            f"Avg likes/post (measured): {kv.engagement_label('avg_likes')}\n"
+            f"Total engagement (measured): {kv.engagement_label('total_engagement')}\n"
             f"Sentiment: {kv_sent.get('positive', 0)} positive / "
             f"{kv_sent.get('neutral', 0)} neutral / {kv_sent.get('negative', 0)} negative\n\n"
             "=== GSK COMPETITOR (@ayokitavaksin) ===\n"
             f"Followers: {ctx.gsk_followers:,}\n"
             f"Posts scraped: {ctx.gsk_posts}\n"
-            f"Avg likes/post: {ctx.gsk_avg_likes}\n"
-            f"Total engagement: {ctx.gsk_total_engagement:,}\n"
+            f"Engagement coverage: {gsk.engagement_coverage_label}\n"
+            f"Avg likes/post (measured): {gsk.engagement_label('avg_likes')}\n"
+            f"Total engagement (measured): {gsk.engagement_label('total_engagement')}\n"
             f"Sentiment: {gsk_sent.get('positive', 0)} positive / "
             f"{gsk_sent.get('neutral', 0)} neutral / {gsk_sent.get('negative', 0)} negative\n\n"
             "=== COMPETITIVE POSITION ===\n"
@@ -1301,6 +1347,7 @@ async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
             "brand_a": {
                 "followers": ctx.kalventis_followers,
                 "posts_scraped": ctx.kalventis_posts,
+                "engagement_measured_posts": kv.engagement_measured_posts,
                 "avg_likes": ctx.kalventis_avg_likes,
                 "total_engagement": ctx.kalventis_total_engagement,
                 "sentiment": kv_sent,
@@ -1308,6 +1355,7 @@ async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
             "brand_b": {
                 "followers": ctx.gsk_followers,
                 "posts_scraped": ctx.gsk_posts,
+                "engagement_measured_posts": gsk.engagement_measured_posts,
                 "avg_likes": ctx.gsk_avg_likes,
                 "total_engagement": ctx.gsk_total_engagement,
                 "sentiment": gsk_sent,
@@ -1331,11 +1379,12 @@ async def social_chat(request: SocialChatRequest) -> SocialChatResponse:
     # frontend sends per-post timestamps; otherwise this is a no-op and the
     # model falls back to external benchmarks.
     if ctx and getattr(ctx, "posts", None):
-        posting_summary = analyze_posting_times(ctx.posts)
+        posting_summary = analyze_posting_times(ctx.posts, measured_only=True)
         if posting_summary:
             context_block += format_posting_time_block(posting_summary)
             logger.info("[chat] posting-time analysis added (%d timestamped posts)", posting_summary["n"])
 
+    context_block += "\n\n" + ENGAGEMENT_RULES
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
     try:
@@ -1398,7 +1447,7 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
 
         posts_text = "\n".join(
             f"  [{p.get('side','')}] @{p.get('username','')}: "
-            f"\"{str(p.get('caption',''))[:150]}\" — {p.get('engagement',0)} eng, {p.get('sentiment','Neutral')}"
+            f"\"{str(p.get('caption',''))[:150]}\" — {p.get('engagement') if p.get('engagement') is not None else 'Unavailable'} eng, {p.get('sentiment','Neutral')}"
             for p in ctx.top_posts[:8]
         ) or "  No post samples available."
 
@@ -1419,23 +1468,23 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
             f"=== {ctx.brand_a_name} (@{ctx.brand_a_username}) === (very low priority — mention only if explicitly asked)\n"
             f"Followers: {a.follower_label}\n"
             f"Posts scraped: {a.posts_scraped}\n"
-            f"Avg likes / post: {a.avg_likes:,}\n"
-            f"Total engagement: {a.total_engagement:,}\n"
+            f"Engagement measurement: {a.engagement_coverage_label}\n"
+            f"Avg likes / post (measured): {a.engagement_label('avg_likes')}\n"
+            f"Total engagement (measured): {a.engagement_label('total_engagement')}\n"
             f"Sentiment: {a.sentiment.positive} positive ({a.sentiment.positive/a_total*100:.0f}%) / "
             f"{a.sentiment.neutral} neutral ({a.sentiment.neutral/a_total*100:.0f}%) / "
             f"{a.sentiment.negative} negative ({a.sentiment.negative/a_total*100:.0f}%)\n\n"
             f"=== {ctx.brand_b_name} (@{ctx.brand_b_username}) ===\n"
             f"Followers: {b.follower_label}\n"
             f"Posts scraped: {b.posts_scraped}\n"
-            f"Avg likes / post: {b.avg_likes:,}\n"
-            f"Total engagement: {b.total_engagement:,}\n"
+            f"Engagement measurement: {b.engagement_coverage_label}\n"
+            f"Avg likes / post (measured): {b.engagement_label('avg_likes')}\n"
+            f"Total engagement (measured): {b.engagement_label('total_engagement')}\n"
             f"Sentiment: {b.sentiment.positive} positive ({b.sentiment.positive/b_total*100:.0f}%) / "
             f"{b.sentiment.neutral} neutral ({b.sentiment.neutral/b_total*100:.0f}%) / "
             f"{b.sentiment.negative} negative ({b.sentiment.negative/b_total*100:.0f}%)\n\n"
             "=== COMPETITIVE COMPARISON ===\n"
-            f"Total engagement (both brands): {comp.get('engagementTotal', 0):,}\n"
-            f"{ctx.brand_a_name} engagement share: {comp.get('brandAEngagementShare', 0)}%\n"
-            f"{ctx.brand_b_name} engagement share: {comp.get('brandBEngagementShare', 0)}%\n"
+            f"Engagement comparison: {monitoring_engagement_comparison(a, b)}\n"
             f"{ctx.brand_a_name} post share: {comp.get('brandAPostShare', 0)}%\n"
             f"{ctx.brand_b_name} post share: {comp.get('brandBPostShare', 0)}%\n\n"
             "=== CONTENT THEMES THE TEAM ALREADY TRACKS (known baseline — find topics BEYOND these) ===\n"
@@ -1458,6 +1507,7 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
                 "followers": a.followers,
                 "followers_approximate": a.followers_approximate,
                 "posts_scraped": a.posts_scraped,
+                "engagement_measured_posts": a.engagement_measured_posts,
                 "avg_likes": a.avg_likes,
                 "total_engagement": a.total_engagement,
                 "sentiment": a.sentiment,
@@ -1466,6 +1516,7 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
                 "followers": b.followers,
                 "followers_approximate": b.followers_approximate,
                 "posts_scraped": b.posts_scraped,
+                "engagement_measured_posts": b.engagement_measured_posts,
                 "avg_likes": b.avg_likes,
                 "total_engagement": b.total_engagement,
                 "sentiment": b.sentiment,
@@ -1487,12 +1538,14 @@ async def monitoring_chat(request: MonitoringChatRequest) -> SocialChatResponse:
     # Ground "best time to post" answers in REAL post-level data when the frontend
     # sends per-post timestamps; otherwise this is a no-op (falls back to benchmarks).
     if ctx and getattr(ctx, "posts", None):
-        posting_summary = analyze_posting_times(ctx.posts)
+        posting_summary = analyze_posting_times(ctx.posts, measured_only=True)
         if posting_summary:
+            context_block += (f"\nPosting-time engagement cohort: {posting_summary['n']}/{len(ctx.posts)} "
+                              "sample posts measured; not all retained content.\n")
             context_block += format_posting_time_block(posting_summary)
             logger.info("[monitoring_chat] posting-time analysis added (%d timestamped posts)", posting_summary["n"])
 
-    context_block += "\n\n" + FOLLOWER_RULES
+    context_block += "\n\n" + FOLLOWER_RULES + "\n\n" + ENGAGEMENT_RULES
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
     try:
