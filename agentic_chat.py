@@ -126,7 +126,7 @@ Rules for NEEDS_VISUALIZATION = yes:
 - User explicitly requests a chart, graph, plot, bar chart, pie chart, or visual
 
 TOPIC rules:
-- If NEEDS_NEWS or NEEDS_VIRAL = yes: extract the core subject (e.g. "vaksin HPV di Indonesia"). Else "none".
+- If NEEDS_NEWS or NEEDS_VIRAL = yes: extract the core subject (e.g. "tren konten Ramadan di Indonesia"). Else "none".
 
 WEB_QUERY rules:
 - If NEEDS_WEB_SEARCH = yes: build a query that FAITHFULLY reflects the user's actual question — do NOT turn a
@@ -319,7 +319,7 @@ def viral_node(state: AgenticChatState) -> AgenticChatState:
     logger.info("[agentic_chat] ▶ viral | topic: %r", topic)
     try:
         meta = state.get("context_meta", {})
-        brand = meta.get("brand_a_name") or "Kalventis (@kenapaharusvaksin)"
+        brand = meta.get("brand_a_name") or "Brand A"
         angles = ni.viral_pipeline(
             topic,
             news_brief=state.get("news_brief"),

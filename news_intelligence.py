@@ -168,7 +168,7 @@ def expand_queries(topic: str, market: str = "Indonesia", n: int = 5) -> list[st
         f"Topic: \"{topic}\"\n\n"
         "Rules:\n"
         "- Mix Indonesian (Bahasa) and English queries.\n"
-        "- Vary the angle: official/regulatory, public reaction, expert/medical, "
+        "- Vary the angle: official/regulatory, public reaction, expert opinion, "
         "controversy/debate, and latest developments.\n"
         "- Each query 4-9 words, optimized for a news search engine.\n"
         'Return ONLY a JSON array of strings, e.g. ["q1","q2",...].'
@@ -322,14 +322,15 @@ def generate_viral_angles(
     topic: str,
     news_brief: dict | None = None,
     internal_context: str = "",
-    brand: str = "Kalventis (@kenapaharusvaksin)",
+    brand: str = "Brand A",
     n: int = 4,
 ) -> list[dict]:
     """Fuse internal sentiment + credible news into scored, platform-ready angles."""
     news_block = brief_to_prompt_block(news_brief or {})
     prompt = (
         "You are a viral content strategist for a digital marketing team. "
-        f"The brand is {brand}, an Indonesian public-health / vaccine-awareness brand.\n\n"
+        f"The brand is {brand}, an Indonesian brand. Do not assume its industry — infer it only "
+        "from the topic and internal metrics below.\n\n"
         f"TOPIC: {topic}\n"
         f"{internal_context}\n"
         f"{news_block}\n\n"
@@ -356,12 +357,12 @@ def generate_viral_angles(
     return angles
 
 
-def brand_safety_review(angles: list[dict], domain: str = "vaccine/public-health (Indonesia)") -> list[dict]:
-    """Pharma/health guardrail — annotate each angle with a compliance verdict.
+def brand_safety_review(angles: list[dict], domain: str = "Indonesian social media") -> list[dict]:
+    """Brand-safety guardrail — annotate each angle with a compliance verdict.
 
     Adds a 'safety' object: {verdict: safe|caution|block, flags:[...], fix: "..."}.
-    Flags unapproved medical/efficacy claims, misinformation, fear-mongering on
-    health crises, anti-vax amplification, and unsafe newsjacking.
+    Flags misleading claims, misinformation, exploiting tragedies/crises and
+    unsafe newsjacking; health/medical claims get BPOM/Kemenkes-style checks.
     """
     if not angles:
         return angles
@@ -371,8 +372,8 @@ def brand_safety_review(angles: list[dict], domain: str = "vaccine/public-health
     )
     prompt = (
         f"You are a regulatory/brand-safety reviewer for {domain} marketing "
-        "(rules similar to BPOM/Kemenkes — no unapproved medical claims, no health misinformation, "
-        "no exploiting a health crisis, no anti-vaccine amplification).\n\n"
+        "(no misleading or unverifiable claims, no misinformation, no exploiting a tragedy or crisis, "
+        "no SARA/hate content; if an angle makes health or medical claims, apply BPOM/Kemenkes-style rules).\n\n"
         f"Review each content angle:\n{block}\n\n"
         "For each index return a verdict:\n"
         "- safe: publish as-is\n"
@@ -397,7 +398,7 @@ def viral_pipeline(
     topic: str,
     news_brief: dict | None = None,
     internal_context: str = "",
-    brand: str = "Kalventis (@kenapaharusvaksin)",
+    brand: str = "Brand A",
     n: int = 4,
 ) -> list[dict]:
     """Generate angles then run them through the safety guardrail."""
